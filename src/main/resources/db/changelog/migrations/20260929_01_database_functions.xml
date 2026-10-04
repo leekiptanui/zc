@@ -1,0 +1,195 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- 20260929_01_database_functions.xml -->
+    <!-- Shared database functions: the current-tenant accessor and the row-maintenance,
+         append-only, pinned-column and published-version trigger functions every concern file uses. -->
+    <!-- Source: agreed design V001 (preamble). Author: adam16wilson7136 -->
+
+    <!-- 1. Extension -->
+    <changeSet id="20260929-01-01" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="1">SELECT CASE WHEN current_setting('server_version_num')::int &gt;= 160000 THEN 1 ELSE 0 END</sqlCheck>
+        </preConditions>
+        <comment>Require PostgreSQL 16 or later and install btree_gist for the no-overlap role-grant exclusion constraint.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP EXTENSION IF EXISTS btree_gist;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 2. Functions -->
+    <changeSet id="20260929-01-02" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname = 'zc_current_tenant'</sqlCheck>
+        </preConditions>
+        <comment>Create function zc_current_tenant().</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Current tenant. Set per transaction:
+--     SELECT set_config('zcare.tenant_id', '<id>', true);
+-- Unset = NULL = all RLS policies false (fail closed).
+CREATE FUNCTION zc_current_tenant() RETURNS bigint
+  LANGUAGE sql STABLE PARALLEL SAFE
+AS $fn$
+  SELECT NULLIF(pg_catalog.current_setting('zcare.tenant_id', true), '')::bigint
+$fn$;
+COMMENT ON FUNCTION zc_current_tenant() IS
+  'Tenant for the current transaction, from the zcare.tenant_id setting. NULL when unset.';
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP FUNCTION zc_current_tenant();
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-01-03" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname = 'zc_touch_row'</sqlCheck>
+        </preConditions>
+        <comment>Create function zc_touch_row().</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Locks id/tenant/created_* and bumps updated_at + row_version.
+CREATE FUNCTION zc_touch_row() RETURNS trigger
+  LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  v_old jsonb := to_jsonb(OLD);
+  v_new jsonb := to_jsonb(NEW);
+  v_col text;
+BEGIN
+  FOREACH v_col IN ARRAY ARRAY['id','tenant_id','created_at','created_by'] LOOP
+    IF v_old ? v_col AND (v_old -> v_col) IS DISTINCT FROM (v_new -> v_col) THEN
+      RAISE EXCEPTION 'trg_zc_row_identity_immutable: %.% cannot be changed', TG_TABLE_NAME, v_col
+        USING ERRCODE = 'integrity_constraint_violation',
+              CONSTRAINT = 'trg_zc_row_identity_immutable',
+              TABLE = TG_TABLE_NAME, COLUMN = v_col;
+    END IF;
+  END LOOP;
+  NEW.updated_at  := now();
+  NEW.row_version := OLD.row_version + 1;
+  RETURN NEW;
+END
+$fn$;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP FUNCTION zc_touch_row();
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-01-04" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname = 'zc_forbid_change'</sqlCheck>
+        </preConditions>
+        <comment>Create function zc_forbid_change().</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Append-only: blocks UPDATE, DELETE, TRUNCATE. TG_ARGV[0] = constraint name.
+CREATE FUNCTION zc_forbid_change() RETURNS trigger
+  LANGUAGE plpgsql
+AS $fn$
+BEGIN
+  RAISE EXCEPTION '%: % is append-only; % is not permitted', TG_ARGV[0], TG_TABLE_NAME, TG_OP
+    USING ERRCODE = 'integrity_constraint_violation',
+          CONSTRAINT = TG_ARGV[0],
+          TABLE = TG_TABLE_NAME;
+END
+$fn$;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP FUNCTION zc_forbid_change();
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-01-05" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname = 'zc_forbid_pinned_change'</sqlCheck>
+        </preConditions>
+        <comment>Create function zc_forbid_pinned_change().</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Pinned columns. TG_ARGV[0] = constraint name, TG_ARGV[1..] = locked columns.
+CREATE FUNCTION zc_forbid_pinned_change() RETURNS trigger
+  LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  v_old jsonb := to_jsonb(OLD);
+  v_new jsonb := to_jsonb(NEW);
+  v_col text;
+  i     integer;
+BEGIN
+  FOR i IN 1 .. TG_NARGS - 1 LOOP
+    v_col := TG_ARGV[i];
+    IF NOT (v_old ? v_col) THEN
+      RAISE EXCEPTION 'zc_forbid_pinned_change misconfigured: %.% does not exist', TG_TABLE_NAME, v_col;
+    END IF;
+    IF (v_old -> v_col) IS DISTINCT FROM (v_new -> v_col) THEN
+      RAISE EXCEPTION '%: %.% is pinned and cannot be changed', TG_ARGV[0], TG_TABLE_NAME, v_col
+        USING ERRCODE = 'integrity_constraint_violation',
+              CONSTRAINT = TG_ARGV[0],
+              TABLE = TG_TABLE_NAME, COLUMN = v_col;
+    END IF;
+  END LOOP;
+  RETURN NEW;
+END
+$fn$;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP FUNCTION zc_forbid_pinned_change();
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-01-06" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname = 'zc_forbid_published_version_change'</sqlCheck>
+        </preConditions>
+        <comment>Create function zc_forbid_published_version_change().</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Published versions are immutable; the only allowed change is retiring them.
+-- Retired rows are fully frozen. TG_ARGV[0] = constraint name.
+CREATE FUNCTION zc_forbid_published_version_change() RETURNS trigger
+  LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  c_retire_cols CONSTANT text[] := ARRAY['status','retired_at','updated_at','updated_by','row_version'];
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    IF OLD.status IN ('published','retired') THEN
+      RAISE EXCEPTION '%: a % version cannot be deleted', TG_ARGV[0], OLD.status
+        USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = TG_ARGV[0], TABLE = TG_TABLE_NAME;
+    END IF;
+    RETURN OLD;
+  END IF;
+
+  IF OLD.status = 'retired' THEN
+    RAISE EXCEPTION '%: a retired version is frozen', TG_ARGV[0]
+      USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = TG_ARGV[0], TABLE = TG_TABLE_NAME;
+  END IF;
+
+  IF OLD.status = 'published' THEN
+    IF NEW.status <> 'retired'
+       OR (to_jsonb(NEW) - c_retire_cols) IS DISTINCT FROM (to_jsonb(OLD) - c_retire_cols) THEN
+      RAISE EXCEPTION '%: a published version is immutable; publish a new version instead', TG_ARGV[0]
+        USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = TG_ARGV[0], TABLE = TG_TABLE_NAME;
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END
+$fn$;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP FUNCTION zc_forbid_published_version_change();
+            ]]></sql>
+        </rollback>
+    </changeSet>
+</databaseChangeLog>

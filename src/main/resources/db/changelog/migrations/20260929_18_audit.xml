@@ -1,0 +1,219 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- 20260929_18_audit.xml -->
+    <!-- Audit and Security: the append-only domain audit trail and the security-event sink. -->
+    <!-- Owned by the audit domain: com.zimasahealth.zcare.domains.audit (roadmap milestone M17). -->
+    <!-- Source: agreed design V001 section 16, V002 grants and V004 (login event types). Author: adam16wilson7136 -->
+
+    <!-- 1. Tables, with their keys, checks, indexes and comments -->
+    <changeSet id="20260929-18-01" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_domain_audit"/></not>
+        </preConditions>
+        <comment>Create table zc_domain_audit.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_domain_audit (
+  id                       bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id                bigint NOT NULL,
+  occurred_at              timestamptz NOT NULL DEFAULT now(),   -- partition key
+  actor_id                 text NOT NULL,
+  organisation_id          bigint,
+  member_id                bigint,
+  programme_version_id     bigint,
+  entity_type              text NOT NULL,
+  entity_id                bigint NOT NULL,
+  -- TODO: restrict to the 26 approved operations.
+  operation                text NOT NULL,
+  previous_state           jsonb,
+  new_state                jsonb,
+  reason                   text,
+  correlation_id           text NOT NULL,
+  consent_wording_version  text,
+  consent_channel          text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_domain_audit_created_by CHECK (btrim(created_by) <> ''),
+  CONSTRAINT pk_zc_domain_audit PRIMARY KEY (id),
+  CONSTRAINT ck_zc_domain_audit_actor CHECK (btrim(actor_id) <> ''),
+  CONSTRAINT ck_zc_domain_audit_entity_type CHECK (btrim(entity_type) <> ''),
+  CONSTRAINT ck_zc_domain_audit_operation CHECK (btrim(operation) <> ''),
+  CONSTRAINT ck_zc_domain_audit_correlation CHECK (btrim(correlation_id) <> '')
+);
+COMMENT ON TABLE zc_domain_audit IS
+  'Append-only record of every material write (PRD 9.8), separate from application logs. Not correctable.';
+COMMENT ON COLUMN zc_domain_audit.previous_state IS 'jsonb: state snapshot before the change. Deliberately not indexed.';
+COMMENT ON COLUMN zc_domain_audit.new_state IS 'jsonb: state snapshot after the change. Deliberately not indexed (04D 15).';
+CREATE INDEX ix_zc_domain_audit_entity      ON zc_domain_audit (tenant_id, entity_type, entity_id, occurred_at DESC);
+CREATE INDEX ix_zc_domain_audit_member      ON zc_domain_audit (tenant_id, member_id, occurred_at DESC) WHERE member_id IS NOT NULL;
+CREATE INDEX ix_zc_domain_audit_actor       ON zc_domain_audit (tenant_id, actor_id, occurred_at DESC);
+CREATE INDEX ix_zc_domain_audit_correlation ON zc_domain_audit (tenant_id, correlation_id);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_domain_audit"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-18-02" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_security_event"/></not>
+        </preConditions>
+        <comment>Create table zc_security_event.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_security_event (
+  id              bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id       bigint, -- NULL if no tenant yet
+  occurred_at     timestamptz NOT NULL DEFAULT now(),   -- partition key
+  event_type      text NOT NULL,
+  actor_id        text,
+  source_address  inet,
+  route           text,
+  correlation_id  text,
+  detail          text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_security_event_created_by CHECK (btrim(created_by) <> ''),
+  CONSTRAINT pk_zc_security_event PRIMARY KEY (id),
+  -- Login event types folded in from V004.
+  CONSTRAINT ck_zc_security_event_type CHECK (event_type IN (
+    'authorisation_denied','tenant_violation_attempt','invalid_webhook_signature',
+    'break_glass_use','audit_export',
+    'authentication_failed','authentication_succeeded','account_locked'))
+);
+COMMENT ON TABLE zc_security_event IS
+  'Separate append-only sink. Deliberately EXCLUDED from RLS: events such as an invalid webhook signature occur before a tenant is resolved (04D 12.3).';
+CREATE INDEX ix_zc_security_event_tenant ON zc_security_event (tenant_id, occurred_at DESC);
+CREATE INDEX ix_zc_security_event_type   ON zc_security_event (event_type, occurred_at DESC);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_security_event"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 2. Foreign keys, after every referenced table exists -->
+    <changeSet id="20260929-18-03" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_organisation"/>
+            <tableExists schemaName="public" tableName="zc_member_reference"/>
+            <tableExists schemaName="public" tableName="zc_programme_version"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_domain_audit'::regclass AND conname IN ('fk_zc_domain_audit_tenant', 'fk_zc_domain_audit_organisation', 'fk_zc_domain_audit_member', 'fk_zc_domain_audit_programme_version')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_domain_audit.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_domain_audit
+  ADD CONSTRAINT fk_zc_domain_audit_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_domain_audit
+  ADD CONSTRAINT fk_zc_domain_audit_organisation FOREIGN KEY (tenant_id, organisation_id)
+    REFERENCES zc_organisation (tenant_id, id);
+ALTER TABLE zc_domain_audit
+  ADD CONSTRAINT fk_zc_domain_audit_member FOREIGN KEY (tenant_id, member_id)
+    REFERENCES zc_member_reference (tenant_id, id);
+ALTER TABLE zc_domain_audit
+  ADD CONSTRAINT fk_zc_domain_audit_programme_version FOREIGN KEY (tenant_id, programme_version_id)
+    REFERENCES zc_programme_version (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_domain_audit" constraintName="fk_zc_domain_audit_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_domain_audit" constraintName="fk_zc_domain_audit_organisation"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_domain_audit" constraintName="fk_zc_domain_audit_member"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_domain_audit" constraintName="fk_zc_domain_audit_programme_version"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-18-04" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_security_event'::regclass AND conname IN ('fk_zc_security_event_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_security_event.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_security_event
+  ADD CONSTRAINT fk_zc_security_event_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_security_event" constraintName="fk_zc_security_event_tenant"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 3. Triggers -->
+    <changeSet id="20260929-18-05" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_domain_audit'::regclass AND tgname IN ('trg_zc_domain_audit_append_only', 'trg_zc_domain_audit_no_truncate')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_domain_audit.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_domain_audit_append_only BEFORE UPDATE OR DELETE ON zc_domain_audit FOR EACH ROW EXECUTE FUNCTION zc_forbid_change('trg_zc_domain_audit_append_only');
+CREATE TRIGGER trg_zc_domain_audit_no_truncate BEFORE TRUNCATE ON zc_domain_audit FOR EACH STATEMENT EXECUTE FUNCTION zc_forbid_change('trg_zc_domain_audit_append_only');
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_domain_audit_append_only ON zc_domain_audit;
+DROP TRIGGER trg_zc_domain_audit_no_truncate ON zc_domain_audit;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-18-06" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_security_event'::regclass AND tgname IN ('trg_zc_security_event_append_only', 'trg_zc_security_event_no_truncate')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_security_event.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_security_event_append_only BEFORE UPDATE OR DELETE ON zc_security_event FOR EACH ROW EXECUTE FUNCTION zc_forbid_change('trg_zc_security_event_append_only');
+CREATE TRIGGER trg_zc_security_event_no_truncate BEFORE TRUNCATE ON zc_security_event FOR EACH STATEMENT EXECUTE FUNCTION zc_forbid_change('trg_zc_security_event_append_only');
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_security_event_append_only ON zc_security_event;
+DROP TRIGGER trg_zc_security_event_no_truncate ON zc_security_event;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 4. Tenant isolation (row-level security) -->
+    <changeSet id="20260929-18-07" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_policy WHERE polname IN ('rls_zc_domain_audit_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Enable and force row-level security, with a tenant policy, on zc_domain_audit.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Tenant isolation. The app must connect as zc_app: superusers bypass RLS.
+ALTER TABLE zc_domain_audit ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_domain_audit FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_domain_audit_tenant ON zc_domain_audit
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP POLICY rls_zc_domain_audit_tenant ON zc_domain_audit;
+ALTER TABLE zc_domain_audit NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_domain_audit DISABLE ROW LEVEL SECURITY;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 5. Privileges for zc_app and zc_housekeeping -->
+    <changeSet id="20260929-18-08" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="2">SELECT count(*) FROM pg_roles WHERE rolname IN ('zc_app', 'zc_housekeeping')</sqlCheck>
+        </preConditions>
+        <comment>Grant the application privileges on the audit tables; append-only tables get no UPDATE, and no table gets DELETE.</comment>
+        <sql splitStatements="false"><![CDATA[
+GRANT SELECT, INSERT ON zc_domain_audit TO zc_app;
+REVOKE UPDATE, DELETE, TRUNCATE ON zc_domain_audit FROM zc_app;
+GRANT USAGE ON SEQUENCE zc_domain_audit_id_seq TO zc_app;
+GRANT SELECT, INSERT ON zc_security_event TO zc_app;
+REVOKE UPDATE, DELETE, TRUNCATE ON zc_security_event FROM zc_app;
+GRANT USAGE ON SEQUENCE zc_security_event_id_seq TO zc_app;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+REVOKE ALL ON zc_domain_audit FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_domain_audit_id_seq FROM zc_app;
+REVOKE ALL ON zc_security_event FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_security_event_id_seq FROM zc_app;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+</databaseChangeLog>

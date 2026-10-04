@@ -1,0 +1,282 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- 20260929_13_observation.xml -->
+    <!-- Observation and Monitoring: monitoring schedules and programme-required observations of
+         record. -->
+    <!-- Owned by the observation domain: com.zimasahealth.zcare.domains.observation (roadmap milestone M13). -->
+    <!-- Source: agreed design V001 section 11 and V002 grants. Author: adam16wilson7136 -->
+
+    <!-- 1. Tables, with their keys, checks, indexes and comments -->
+    <changeSet id="20260929-13-01" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_monitoring_schedule"/></not>
+        </preConditions>
+        <comment>Create table zc_monitoring_schedule.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_monitoring_schedule (
+  id                    bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id             bigint NOT NULL,
+  enrolment_id          bigint NOT NULL,
+  programme_version_id  bigint NOT NULL,
+  observation_type_id   bigint NOT NULL,
+  cadence_days          integer NOT NULL,
+  starts_on             date NOT NULL DEFAULT current_date,
+  next_due_on           date,
+  is_active             boolean NOT NULL DEFAULT true,
+  ended_on              date,
+  end_reason            text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_monitoring_schedule_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_monitoring_schedule_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_monitoring_schedule PRIMARY KEY (id),
+  CONSTRAINT ck_zc_monitoring_schedule_cadence CHECK (cadence_days > 0),
+  CONSTRAINT ck_zc_monitoring_schedule_ended CHECK (is_active OR ended_on IS NOT NULL)
+);
+CREATE UNIQUE INDEX uq_zc_monitoring_schedule_active
+  ON zc_monitoring_schedule (tenant_id, enrolment_id, observation_type_id) WHERE is_active;
+CREATE INDEX ix_zc_monitoring_schedule_due ON zc_monitoring_schedule (tenant_id, next_due_on) WHERE is_active;
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_monitoring_schedule"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-13-02" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_observation"/></not>
+        </preConditions>
+        <comment>Create table zc_observation.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_observation (
+  id                    bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id             bigint NOT NULL,
+  enrolment_id          bigint NOT NULL,
+  member_id             bigint NOT NULL,
+  programme_version_id  bigint NOT NULL,
+  observation_type_id   bigint NOT NULL,
+  value_numeric         numeric NOT NULL,
+  unit                  text NOT NULL,
+  observed_at           timestamptz NOT NULL,
+  source                text NOT NULL,
+  source_ref            text,
+  loinc_code            text,
+  is_invalidated        boolean NOT NULL DEFAULT false,
+  invalidated_at        timestamptz,
+  invalidated_by        text,
+  invalidation_reason   text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_observation_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_observation_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_observation PRIMARY KEY (id),
+  CONSTRAINT ck_zc_observation_source CHECK (source IN (
+    'member_reported','care_team_recorded','provider','laboratory','device')),
+  CONSTRAINT ck_zc_observation_invalidation CHECK (
+    (NOT is_invalidated AND invalidated_at IS NULL AND invalidated_by IS NULL AND invalidation_reason IS NULL)
+    OR (is_invalidated
+        AND invalidated_at IS NOT NULL
+        AND nullif(btrim(invalidated_by), '') IS NOT NULL
+        AND nullif(btrim(invalidation_reason), '') IS NOT NULL))
+);
+COMMENT ON TABLE zc_observation IS
+  'Programme-required measurement of record. A wrong value is invalidated, never edited (trg_zc_observation_correction_only).';
+CREATE INDEX ix_zc_observation_trend
+  ON zc_observation (tenant_id, enrolment_id, observation_type_id, observed_at DESC)
+  WHERE NOT is_invalidated;
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_observation"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 2. Foreign keys, after every referenced table exists -->
+    <changeSet id="20260929-13-03" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_enrolment"/>
+            <tableExists schemaName="public" tableName="zc_observation_type"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_monitoring_schedule'::regclass AND conname IN ('fk_zc_monitoring_schedule_tenant', 'fk_zc_monitoring_schedule_enrolment', 'fk_zc_monitoring_schedule_observation_type')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_monitoring_schedule.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_monitoring_schedule
+  ADD CONSTRAINT fk_zc_monitoring_schedule_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_monitoring_schedule
+  ADD CONSTRAINT fk_zc_monitoring_schedule_enrolment FOREIGN KEY (tenant_id, enrolment_id, programme_version_id)
+    REFERENCES zc_enrolment (tenant_id, id, programme_version_id);
+ALTER TABLE zc_monitoring_schedule
+  ADD CONSTRAINT fk_zc_monitoring_schedule_observation_type
+    FOREIGN KEY (tenant_id, observation_type_id, programme_version_id)
+    REFERENCES zc_observation_type (tenant_id, id, programme_version_id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_monitoring_schedule" constraintName="fk_zc_monitoring_schedule_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_monitoring_schedule" constraintName="fk_zc_monitoring_schedule_enrolment"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_monitoring_schedule" constraintName="fk_zc_monitoring_schedule_observation_type"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-13-04" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_enrolment"/>
+            <tableExists schemaName="public" tableName="zc_observation_type"/>
+            <tableExists schemaName="public" tableName="zc_member_reference"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_observation'::regclass AND conname IN ('fk_zc_observation_tenant', 'fk_zc_observation_enrolment', 'fk_zc_observation_type_version', 'fk_zc_observation_type_unit', 'fk_zc_observation_member')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_observation.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_observation
+  ADD CONSTRAINT fk_zc_observation_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+-- Type must match the enrolment's version; unit must match the type.
+ALTER TABLE zc_observation
+  ADD CONSTRAINT fk_zc_observation_enrolment
+    FOREIGN KEY (tenant_id, enrolment_id, programme_version_id, member_id)
+    REFERENCES zc_enrolment (tenant_id, id, programme_version_id, member_id);
+ALTER TABLE zc_observation
+  ADD CONSTRAINT fk_zc_observation_type_version
+    FOREIGN KEY (tenant_id, observation_type_id, programme_version_id)
+    REFERENCES zc_observation_type (tenant_id, id, programme_version_id);
+ALTER TABLE zc_observation
+  ADD CONSTRAINT fk_zc_observation_type_unit
+    FOREIGN KEY (tenant_id, observation_type_id, unit)
+    REFERENCES zc_observation_type (tenant_id, id, unit) ON UPDATE RESTRICT;
+ALTER TABLE zc_observation
+  ADD CONSTRAINT fk_zc_observation_member FOREIGN KEY (tenant_id, member_id)
+    REFERENCES zc_member_reference (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_observation" constraintName="fk_zc_observation_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_observation" constraintName="fk_zc_observation_enrolment"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_observation" constraintName="fk_zc_observation_type_version"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_observation" constraintName="fk_zc_observation_type_unit"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_observation" constraintName="fk_zc_observation_member"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 3. Triggers -->
+    <changeSet id="20260929-13-05" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_monitoring_schedule'::regclass AND tgname IN ('trg_zc_monitoring_schedule_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_monitoring_schedule.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_monitoring_schedule_touch BEFORE UPDATE ON zc_monitoring_schedule FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_monitoring_schedule_touch ON zc_monitoring_schedule;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-13-06" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_observation'::regclass AND tgname IN ('trg_zc_observation_correction_only', 'trg_zc_observation_touch')</sqlCheck>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('zc_observation_correction_only')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_observation.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Observations can't be edited, only invalidated.
+CREATE FUNCTION zc_observation_correction_only() RETURNS trigger
+  LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  c_pinned CONSTANT text[] := ARRAY['enrolment_id','member_id','programme_version_id','observation_type_id',
+                                    'value_numeric','unit','observed_at','source'];
+  v_old jsonb := to_jsonb(OLD);
+  v_new jsonb := to_jsonb(NEW);
+  v_col text;
+BEGIN
+  FOREACH v_col IN ARRAY c_pinned LOOP
+    IF (v_old -> v_col) IS DISTINCT FROM (v_new -> v_col) THEN
+      RAISE EXCEPTION 'trg_zc_observation_correction_only: %.% cannot be edited; invalidate the row and record a new observation', TG_TABLE_NAME, v_col
+        USING ERRCODE = 'integrity_constraint_violation',
+              CONSTRAINT = 'trg_zc_observation_correction_only', TABLE = TG_TABLE_NAME, COLUMN = v_col;
+    END IF;
+  END LOOP;
+  IF OLD.is_invalidated
+     AND (NEW.is_invalidated IS DISTINCT FROM OLD.is_invalidated
+          OR NEW.invalidated_at IS DISTINCT FROM OLD.invalidated_at
+          OR NEW.invalidated_by IS DISTINCT FROM OLD.invalidated_by
+          OR NEW.invalidation_reason IS DISTINCT FROM OLD.invalidation_reason) THEN
+    RAISE EXCEPTION 'trg_zc_observation_correction_only: invalidation of observation % is final', OLD.id
+      USING ERRCODE = 'integrity_constraint_violation',
+            CONSTRAINT = 'trg_zc_observation_correction_only', TABLE = TG_TABLE_NAME;
+  END IF;
+  RETURN NEW;
+END
+$fn$;
+
+CREATE TRIGGER trg_zc_observation_correction_only
+  BEFORE UPDATE ON zc_observation
+  FOR EACH ROW EXECUTE FUNCTION zc_observation_correction_only();
+CREATE TRIGGER trg_zc_observation_touch BEFORE UPDATE ON zc_observation FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_observation_correction_only ON zc_observation;
+DROP TRIGGER trg_zc_observation_touch ON zc_observation;
+DROP FUNCTION zc_observation_correction_only();
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 4. Tenant isolation (row-level security) -->
+    <changeSet id="20260929-13-07" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_policy WHERE polname IN ('rls_zc_monitoring_schedule_tenant', 'rls_zc_observation_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Enable and force row-level security, with a tenant policy, on zc_monitoring_schedule, zc_observation.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Tenant isolation. The app must connect as zc_app: superusers bypass RLS.
+ALTER TABLE zc_monitoring_schedule ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_monitoring_schedule FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_monitoring_schedule_tenant ON zc_monitoring_schedule
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_observation ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_observation FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_observation_tenant ON zc_observation
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP POLICY rls_zc_monitoring_schedule_tenant ON zc_monitoring_schedule;
+ALTER TABLE zc_monitoring_schedule NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_monitoring_schedule DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_observation_tenant ON zc_observation;
+ALTER TABLE zc_observation NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_observation DISABLE ROW LEVEL SECURITY;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 5. Privileges for zc_app and zc_housekeeping -->
+    <changeSet id="20260929-13-08" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="2">SELECT count(*) FROM pg_roles WHERE rolname IN ('zc_app', 'zc_housekeeping')</sqlCheck>
+        </preConditions>
+        <comment>Grant the application privileges on the observation tables; append-only tables get no UPDATE, and no table gets DELETE.</comment>
+        <sql splitStatements="false"><![CDATA[
+GRANT SELECT, INSERT, UPDATE ON zc_monitoring_schedule TO zc_app;
+GRANT USAGE ON SEQUENCE zc_monitoring_schedule_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_observation TO zc_app;
+GRANT USAGE ON SEQUENCE zc_observation_id_seq TO zc_app;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+REVOKE ALL ON zc_monitoring_schedule FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_monitoring_schedule_id_seq FROM zc_app;
+REVOKE ALL ON zc_observation FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_observation_id_seq FROM zc_app;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+</databaseChangeLog>

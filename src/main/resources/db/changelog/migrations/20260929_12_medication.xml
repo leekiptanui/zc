@@ -1,0 +1,317 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- 20260929_12_medication.xml -->
+    <!-- Medication Coordination: medication-plan links, refill requests and adherence events. ZCare
+         never prescribes or dispenses. -->
+    <!-- Owned by the medication domain: com.zimasahealth.zcare.domains.medication (roadmap milestone M12). -->
+    <!-- Source: agreed design V001 section 10 and V002 grants. Author: adam16wilson7136 -->
+
+    <!-- 1. Tables, with their keys, checks, indexes and comments -->
+    <changeSet id="20260929-12-01" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_medication_coordination"/></not>
+        </preConditions>
+        <comment>Create table zc_medication_coordination.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_medication_coordination (
+  id                  bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id           bigint NOT NULL,
+  enrolment_id        bigint NOT NULL,
+  plan_ref            text NOT NULL,   -- plan id in the provider system
+  plan_ref_system     text NOT NULL,   -- free text from adapter
+  medication_display  text,
+  status              text NOT NULL DEFAULT 'active',
+  started_on          date,
+  ended_on            date,
+  end_reason          text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_medication_coordination_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_medication_coordination_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_medication_coordination PRIMARY KEY (id),
+  CONSTRAINT uq_zc_medication_coordination_fk_enrolment UNIQUE (tenant_id, id, enrolment_id),
+  CONSTRAINT ck_zc_medication_coordination_plan_ref CHECK (btrim(plan_ref) <> ''),
+  CONSTRAINT ck_zc_medication_coordination_plan_ref_system CHECK (btrim(plan_ref_system) <> ''),
+  CONSTRAINT ck_zc_medication_coordination_status CHECK (status IN ('active','paused','ended')),
+  CONSTRAINT ck_zc_medication_coordination_ended CHECK (
+    status <> 'ended' OR (ended_on IS NOT NULL AND nullif(btrim(end_reason), '') IS NOT NULL)),
+  CONSTRAINT ck_zc_medication_coordination_dates CHECK (
+    started_on IS NULL OR ended_on IS NULL OR ended_on >= started_on)
+);
+CREATE INDEX ix_zc_medication_coordination_enrolment ON zc_medication_coordination (tenant_id, enrolment_id);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_medication_coordination"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-12-02" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_refill_request"/></not>
+        </preConditions>
+        <comment>Create table zc_refill_request.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_refill_request (
+  id                          bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id                   bigint NOT NULL,
+  enrolment_id                bigint NOT NULL,
+  medication_coordination_id  bigint NOT NULL,
+  status                      text NOT NULL DEFAULT 'requested',
+  due_on                      date,
+  is_overdue                  boolean NOT NULL DEFAULT false,   -- independent of status
+  routed_to_ref               text,
+  fulfilment_state            text NOT NULL DEFAULT 'pending',  -- separate from routing
+  confirmation_source         text,
+  fulfilment_recorded_at      timestamptz,
+  fulfilment_recorded_by      text,
+  concluded_at                timestamptz,
+  cancel_reason               text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_refill_request_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_refill_request_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_refill_request PRIMARY KEY (id),
+  CONSTRAINT ck_zc_refill_request_status CHECK (status IN ('requested','routed','in_progress','concluded','cancelled')),
+  CONSTRAINT ck_zc_refill_request_fulfilment_state CHECK (
+    fulfilment_state IN ('pending','member_reported','confirmed','not_fulfilled')),
+  CONSTRAINT ck_zc_refill_request_confirmation_source CHECK (
+    confirmation_source IN ('member_reported','pharmacy','provider')),
+  -- Confirmed needs pharmacy or provider.
+  CONSTRAINT ck_zc_refill_confirmed_requires_authorised_source CHECK (
+    fulfilment_state <> 'confirmed' OR confirmation_source IN ('pharmacy','provider')),
+  CONSTRAINT ck_zc_refill_request_member_reported CHECK (
+    fulfilment_state <> 'member_reported' OR confirmation_source = 'member_reported'),
+  CONSTRAINT ck_zc_refill_request_fulfilment_evidence CHECK (
+    (fulfilment_state = 'pending' AND confirmation_source IS NULL)
+    OR (fulfilment_state <> 'pending' AND confirmation_source IS NOT NULL AND fulfilment_recorded_at IS NOT NULL)),
+  CONSTRAINT ck_zc_refill_request_concluded CHECK (status <> 'concluded' OR concluded_at IS NOT NULL),
+  CONSTRAINT ck_zc_refill_request_cancelled CHECK (status <> 'cancelled' OR nullif(btrim(cancel_reason), '') IS NOT NULL)
+);
+CREATE UNIQUE INDEX uq_zc_refill_one_open
+  ON zc_refill_request (tenant_id, medication_coordination_id)
+  WHERE status IN ('requested','routed','in_progress');
+CREATE INDEX ix_zc_refill_overdue
+  ON zc_refill_request (tenant_id, due_on)
+  WHERE is_overdue AND status IN ('requested','routed','in_progress');
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_refill_request"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-12-03" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_adherence_event"/></not>
+        </preConditions>
+        <comment>Create table zc_adherence_event.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_adherence_event (
+  id                          bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id                   bigint NOT NULL,
+  enrolment_id                bigint NOT NULL,
+  medication_coordination_id  bigint, -- optional
+  event_type                  text NOT NULL,
+  source                      text NOT NULL,
+  occurred_at                 timestamptz NOT NULL,
+  notes                       text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_adherence_event_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_adherence_event_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_adherence_event PRIMARY KEY (id),
+  CONSTRAINT ck_zc_adherence_event_type CHECK (btrim(event_type) <> ''),
+  CONSTRAINT ck_zc_adherence_event_source CHECK (source IN ('member_reported','care_team','pharmacy','provider'))
+);
+CREATE INDEX ix_zc_adherence_event_enrolment ON zc_adherence_event (tenant_id, enrolment_id, occurred_at DESC);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_adherence_event"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 2. Foreign keys, after every referenced table exists -->
+    <changeSet id="20260929-12-04" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_enrolment"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_medication_coordination'::regclass AND conname IN ('fk_zc_medication_coordination_tenant', 'fk_zc_medication_coordination_enrolment')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_medication_coordination.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_medication_coordination
+  ADD CONSTRAINT fk_zc_medication_coordination_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_medication_coordination
+  ADD CONSTRAINT fk_zc_medication_coordination_enrolment FOREIGN KEY (tenant_id, enrolment_id)
+    REFERENCES zc_enrolment (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_medication_coordination" constraintName="fk_zc_medication_coordination_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_medication_coordination" constraintName="fk_zc_medication_coordination_enrolment"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-12-05" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_enrolment"/>
+            <tableExists schemaName="public" tableName="zc_medication_coordination"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_refill_request'::regclass AND conname IN ('fk_zc_refill_request_tenant', 'fk_zc_refill_request_enrolment', 'fk_zc_refill_request_medication_coordination')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_refill_request.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_refill_request
+  ADD CONSTRAINT fk_zc_refill_request_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_refill_request
+  ADD CONSTRAINT fk_zc_refill_request_enrolment FOREIGN KEY (tenant_id, enrolment_id)
+    REFERENCES zc_enrolment (tenant_id, id);
+ALTER TABLE zc_refill_request
+  ADD CONSTRAINT fk_zc_refill_request_medication_coordination
+    FOREIGN KEY (tenant_id, medication_coordination_id, enrolment_id)
+    REFERENCES zc_medication_coordination (tenant_id, id, enrolment_id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_refill_request" constraintName="fk_zc_refill_request_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_refill_request" constraintName="fk_zc_refill_request_enrolment"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_refill_request" constraintName="fk_zc_refill_request_medication_coordination"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-12-06" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_enrolment"/>
+            <tableExists schemaName="public" tableName="zc_medication_coordination"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_adherence_event'::regclass AND conname IN ('fk_zc_adherence_event_tenant', 'fk_zc_adherence_event_enrolment', 'fk_zc_adherence_event_medication_coordination')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_adherence_event.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_adherence_event
+  ADD CONSTRAINT fk_zc_adherence_event_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_adherence_event
+  ADD CONSTRAINT fk_zc_adherence_event_enrolment FOREIGN KEY (tenant_id, enrolment_id)
+    REFERENCES zc_enrolment (tenant_id, id);
+ALTER TABLE zc_adherence_event
+  ADD CONSTRAINT fk_zc_adherence_event_medication_coordination
+    FOREIGN KEY (tenant_id, medication_coordination_id, enrolment_id)
+    REFERENCES zc_medication_coordination (tenant_id, id, enrolment_id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_adherence_event" constraintName="fk_zc_adherence_event_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_adherence_event" constraintName="fk_zc_adherence_event_enrolment"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_adherence_event" constraintName="fk_zc_adherence_event_medication_coordination"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 3. Triggers -->
+    <changeSet id="20260929-12-07" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_medication_coordination'::regclass AND tgname IN ('trg_zc_medication_coordination_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_medication_coordination.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_medication_coordination_touch BEFORE UPDATE ON zc_medication_coordination FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_medication_coordination_touch ON zc_medication_coordination;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-12-08" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_refill_request'::regclass AND tgname IN ('trg_zc_refill_request_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_refill_request.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_refill_request_touch BEFORE UPDATE ON zc_refill_request FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_refill_request_touch ON zc_refill_request;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-12-09" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_adherence_event'::regclass AND tgname IN ('trg_zc_adherence_event_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_adherence_event.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_adherence_event_touch BEFORE UPDATE ON zc_adherence_event FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_adherence_event_touch ON zc_adherence_event;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 4. Tenant isolation (row-level security) -->
+    <changeSet id="20260929-12-10" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_policy WHERE polname IN ('rls_zc_medication_coordination_tenant', 'rls_zc_refill_request_tenant', 'rls_zc_adherence_event_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Enable and force row-level security, with a tenant policy, on zc_medication_coordination, zc_refill_request, zc_adherence_event.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Tenant isolation. The app must connect as zc_app: superusers bypass RLS.
+ALTER TABLE zc_medication_coordination ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_medication_coordination FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_medication_coordination_tenant ON zc_medication_coordination
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_refill_request ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_refill_request FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_refill_request_tenant ON zc_refill_request
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_adherence_event ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_adherence_event FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_adherence_event_tenant ON zc_adherence_event
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP POLICY rls_zc_medication_coordination_tenant ON zc_medication_coordination;
+ALTER TABLE zc_medication_coordination NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_medication_coordination DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_refill_request_tenant ON zc_refill_request;
+ALTER TABLE zc_refill_request NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_refill_request DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_adherence_event_tenant ON zc_adherence_event;
+ALTER TABLE zc_adherence_event NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_adherence_event DISABLE ROW LEVEL SECURITY;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 5. Privileges for zc_app and zc_housekeeping -->
+    <changeSet id="20260929-12-11" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="2">SELECT count(*) FROM pg_roles WHERE rolname IN ('zc_app', 'zc_housekeeping')</sqlCheck>
+        </preConditions>
+        <comment>Grant the application privileges on the medication tables; append-only tables get no UPDATE, and no table gets DELETE.</comment>
+        <sql splitStatements="false"><![CDATA[
+GRANT SELECT, INSERT, UPDATE ON zc_medication_coordination TO zc_app;
+GRANT USAGE ON SEQUENCE zc_medication_coordination_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_refill_request TO zc_app;
+GRANT USAGE ON SEQUENCE zc_refill_request_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_adherence_event TO zc_app;
+GRANT USAGE ON SEQUENCE zc_adherence_event_id_seq TO zc_app;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+REVOKE ALL ON zc_medication_coordination FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_medication_coordination_id_seq FROM zc_app;
+REVOKE ALL ON zc_refill_request FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_refill_request_id_seq FROM zc_app;
+REVOKE ALL ON zc_adherence_event FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_adherence_event_id_seq FROM zc_app;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+</databaseChangeLog>

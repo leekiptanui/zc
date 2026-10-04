@@ -1,0 +1,514 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- 20260929_09_careplan.xml -->
+    <!-- Care Planning: care plans, goals, interventions, plan links and the append-only review
+         history. -->
+    <!-- Owned by the careplan domain: com.zimasahealth.zcare.domains.careplan (roadmap milestone M9). -->
+    <!-- Source: agreed design V001 section 07 and V002 grants. Author: adam16wilson7136 -->
+
+    <!-- 1. Tables, with their keys, checks, indexes and comments -->
+    <changeSet id="20260929-09-01" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_care_plan"/></not>
+        </preConditions>
+        <comment>Create table zc_care_plan.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_care_plan (
+  id                    bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id             bigint NOT NULL,
+  enrolment_id          bigint NOT NULL,
+  programme_version_id  bigint NOT NULL,
+  supersedes_plan_id    bigint,
+  version_number        integer NOT NULL DEFAULT 1,
+  status                text NOT NULL DEFAULT 'draft',
+  summary               text,
+  submitted_at          timestamptz,
+  approved_by           text,
+  approved_at           timestamptz,
+  activated_at          timestamptz,
+  rejection_reason      text,
+  closed_at             timestamptz,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_care_plan_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_care_plan_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_care_plan PRIMARY KEY (id),
+  CONSTRAINT uq_zc_care_plan_fk_target    UNIQUE (tenant_id, id),
+  CONSTRAINT uq_zc_care_plan_fk_version   UNIQUE (tenant_id, id, programme_version_id),
+  CONSTRAINT uq_zc_care_plan_fk_enrolment UNIQUE (tenant_id, id, enrolment_id),
+  CONSTRAINT uq_zc_care_plan_version_number UNIQUE (tenant_id, enrolment_id, version_number),
+  CONSTRAINT ck_zc_care_plan_status CHECK (status IN (
+    'draft','pending_approval','active','revised','suspended','completed','closed','rejected')),
+  CONSTRAINT ck_zc_care_plan_version_number CHECK (version_number > 0),
+  -- Active plans need an approver.
+  CONSTRAINT ck_zc_care_plan_activation CHECK (
+    status <> 'active'
+    OR (nullif(btrim(approved_by), '') IS NOT NULL AND approved_at IS NOT NULL AND activated_at IS NOT NULL)),
+  CONSTRAINT ck_zc_care_plan_approval_pair CHECK ((approved_by IS NULL) = (approved_at IS NULL)),
+  CONSTRAINT ck_zc_care_plan_activation_after_approval CHECK (
+    activated_at IS NULL OR (approved_at IS NOT NULL AND activated_at >= approved_at)),
+  CONSTRAINT ck_zc_care_plan_submitted CHECK (status <> 'pending_approval' OR submitted_at IS NOT NULL),
+  CONSTRAINT ck_zc_care_plan_rejection CHECK (status <> 'rejected' OR nullif(btrim(rejection_reason), '') IS NOT NULL),
+  CONSTRAINT ck_zc_care_plan_not_self_superseding CHECK (supersedes_plan_id IS NULL OR supersedes_plan_id <> id)
+);
+COMMENT ON TABLE zc_care_plan IS
+  'Care-coordination artefact, NOT a clinical order. Absence of approval is never approval.';
+CREATE UNIQUE INDEX uq_zc_care_plan_one_active ON zc_care_plan (tenant_id, enrolment_id) WHERE status = 'active';
+CREATE INDEX ix_zc_care_plan_approval ON zc_care_plan (tenant_id, submitted_at) WHERE status = 'pending_approval';
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_care_plan"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-09-02" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_goal"/></not>
+        </preConditions>
+        <comment>Create table zc_goal.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_goal (
+  id                    bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id             bigint NOT NULL,
+  care_plan_id          bigint NOT NULL,
+  programme_version_id  bigint NOT NULL,
+  goal_type_id          bigint NOT NULL,
+  description           text NOT NULL,
+  target_value          numeric,
+  target_unit           text,
+  target_criteria       text,
+  target_date           date,
+  status                text NOT NULL DEFAULT 'active',
+  status_reason         text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_goal_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_goal_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_goal PRIMARY KEY (id),
+  CONSTRAINT uq_zc_goal_fk_care_plan UNIQUE (tenant_id, id, care_plan_id),
+  CONSTRAINT ck_zc_goal_description CHECK (btrim(description) <> ''),
+  CONSTRAINT ck_zc_goal_measurable CHECK (
+    (target_value IS NOT NULL AND nullif(btrim(target_unit), '') IS NOT NULL)
+    OR nullif(btrim(target_criteria), '') IS NOT NULL),
+  CONSTRAINT ck_zc_goal_status CHECK (status IN ('proposed','active','achieved','not_achieved','discontinued'))
+);
+CREATE INDEX ix_zc_goal_care_plan ON zc_goal (tenant_id, care_plan_id);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_goal"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-09-03" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_intervention"/></not>
+        </preConditions>
+        <comment>Create table zc_intervention.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_intervention (
+  id             bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id      bigint NOT NULL,
+  care_plan_id   bigint NOT NULL,
+  goal_id        bigint, -- NULL = plan-level
+  owner_role     text NOT NULL,
+  description    text NOT NULL,
+  frequency      text,
+  status         text NOT NULL DEFAULT 'planned',
+  status_reason  text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_intervention_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_intervention_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_intervention PRIMARY KEY (id),
+  CONSTRAINT ck_zc_intervention_owner_role CHECK (btrim(owner_role) <> ''),
+  CONSTRAINT ck_zc_intervention_description CHECK (btrim(description) <> ''),
+  CONSTRAINT ck_zc_intervention_status CHECK (status IN ('planned','active','completed','discontinued'))
+);
+CREATE INDEX ix_zc_intervention_care_plan ON zc_intervention (tenant_id, care_plan_id);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_intervention"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-09-04" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_care_plan_link"/></not>
+        </preConditions>
+        <comment>Create table zc_care_plan_link.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_care_plan_link (
+  id            bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id     bigint NOT NULL,
+  care_plan_id  bigint NOT NULL,
+  link_type     text NOT NULL,
+  ref_id        bigint NOT NULL, -- polymorphic, no FK
+  note          text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_care_plan_link_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_care_plan_link_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_care_plan_link PRIMARY KEY (id),
+  CONSTRAINT uq_zc_care_plan_link_target UNIQUE (tenant_id, care_plan_id, link_type, ref_id),
+  CONSTRAINT ck_zc_care_plan_link_type CHECK (link_type IN (
+    'referral','task','transition','medication_coordination','monitoring_schedule',
+    'assessment','care_gap','outreach_request'))
+);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_care_plan_link"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-09-05" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_plan_review"/></not>
+        </preConditions>
+        <comment>Create table zc_plan_review.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_plan_review (
+  id            bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id     bigint NOT NULL,
+  care_plan_id  bigint NOT NULL,
+  outcome       text NOT NULL,
+  reviewed_by   text NOT NULL,
+  reviewed_at   timestamptz NOT NULL DEFAULT now(),
+  notes         text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_plan_review_created_by CHECK (btrim(created_by) <> ''),
+  CONSTRAINT pk_zc_plan_review PRIMARY KEY (id),
+  CONSTRAINT ck_zc_plan_review_outcome CHECK (outcome IN (
+    'approved','rejected','changes_requested','continue_unchanged','revise','close')),
+  CONSTRAINT ck_zc_plan_review_reviewer CHECK (btrim(reviewed_by) <> ''),
+  CONSTRAINT ck_zc_plan_review_reason CHECK (
+    outcome IN ('approved','continue_unchanged') OR nullif(btrim(notes), '') IS NOT NULL)
+);
+COMMENT ON TABLE zc_plan_review IS 'Append-only: every approval round and review is retained.';
+CREATE INDEX ix_zc_plan_review_care_plan ON zc_plan_review (tenant_id, care_plan_id, reviewed_at DESC);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_plan_review"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 2. Foreign keys, after every referenced table exists -->
+    <changeSet id="20260929-09-06" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_enrolment"/>
+            <tableExists schemaName="public" tableName="zc_programme_version"/>
+            <tableExists schemaName="public" tableName="zc_care_plan"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_care_plan'::regclass AND conname IN ('fk_zc_care_plan_tenant', 'fk_zc_care_plan_enrolment', 'fk_zc_care_plan_programme_version', 'fk_zc_care_plan_supersedes')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_care_plan.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_care_plan
+  ADD CONSTRAINT fk_zc_care_plan_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+-- Plan version must match the enrolment's version.
+ALTER TABLE zc_care_plan
+  ADD CONSTRAINT fk_zc_care_plan_enrolment FOREIGN KEY (tenant_id, enrolment_id, programme_version_id)
+    REFERENCES zc_enrolment (tenant_id, id, programme_version_id);
+ALTER TABLE zc_care_plan
+  ADD CONSTRAINT fk_zc_care_plan_programme_version FOREIGN KEY (tenant_id, programme_version_id)
+    REFERENCES zc_programme_version (tenant_id, id);
+ALTER TABLE zc_care_plan
+  ADD CONSTRAINT fk_zc_care_plan_supersedes FOREIGN KEY (tenant_id, supersedes_plan_id, enrolment_id)
+    REFERENCES zc_care_plan (tenant_id, id, enrolment_id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_care_plan" constraintName="fk_zc_care_plan_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_care_plan" constraintName="fk_zc_care_plan_enrolment"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_care_plan" constraintName="fk_zc_care_plan_programme_version"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_care_plan" constraintName="fk_zc_care_plan_supersedes"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-09-07" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_care_plan"/>
+            <tableExists schemaName="public" tableName="zc_goal_type"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_goal'::regclass AND conname IN ('fk_zc_goal_tenant', 'fk_zc_goal_care_plan', 'fk_zc_goal_goal_type')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_goal.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_goal
+  ADD CONSTRAINT fk_zc_goal_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+-- Goal type must match the plan's programme version.
+ALTER TABLE zc_goal
+  ADD CONSTRAINT fk_zc_goal_care_plan FOREIGN KEY (tenant_id, care_plan_id, programme_version_id)
+    REFERENCES zc_care_plan (tenant_id, id, programme_version_id);
+ALTER TABLE zc_goal
+  ADD CONSTRAINT fk_zc_goal_goal_type FOREIGN KEY (tenant_id, goal_type_id, programme_version_id)
+    REFERENCES zc_goal_type (tenant_id, id, programme_version_id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_goal" constraintName="fk_zc_goal_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_goal" constraintName="fk_zc_goal_care_plan"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_goal" constraintName="fk_zc_goal_goal_type"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-09-08" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_care_plan"/>
+            <tableExists schemaName="public" tableName="zc_goal"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_intervention'::regclass AND conname IN ('fk_zc_intervention_tenant', 'fk_zc_intervention_care_plan', 'fk_zc_intervention_goal')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_intervention.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_intervention
+  ADD CONSTRAINT fk_zc_intervention_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_intervention
+  ADD CONSTRAINT fk_zc_intervention_care_plan FOREIGN KEY (tenant_id, care_plan_id)
+    REFERENCES zc_care_plan (tenant_id, id);
+-- Goal must be in the same plan.
+ALTER TABLE zc_intervention
+  ADD CONSTRAINT fk_zc_intervention_goal FOREIGN KEY (tenant_id, goal_id, care_plan_id)
+    REFERENCES zc_goal (tenant_id, id, care_plan_id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_intervention" constraintName="fk_zc_intervention_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_intervention" constraintName="fk_zc_intervention_care_plan"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_intervention" constraintName="fk_zc_intervention_goal"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-09-09" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_care_plan"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_care_plan_link'::regclass AND conname IN ('fk_zc_care_plan_link_tenant', 'fk_zc_care_plan_link_care_plan')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_care_plan_link.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_care_plan_link
+  ADD CONSTRAINT fk_zc_care_plan_link_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_care_plan_link
+  ADD CONSTRAINT fk_zc_care_plan_link_care_plan FOREIGN KEY (tenant_id, care_plan_id)
+    REFERENCES zc_care_plan (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_care_plan_link" constraintName="fk_zc_care_plan_link_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_care_plan_link" constraintName="fk_zc_care_plan_link_care_plan"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-09-10" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_care_plan"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_plan_review'::regclass AND conname IN ('fk_zc_plan_review_tenant', 'fk_zc_plan_review_care_plan')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_plan_review.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_plan_review
+  ADD CONSTRAINT fk_zc_plan_review_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_plan_review
+  ADD CONSTRAINT fk_zc_plan_review_care_plan FOREIGN KEY (tenant_id, care_plan_id)
+    REFERENCES zc_care_plan (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_plan_review" constraintName="fk_zc_plan_review_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_plan_review" constraintName="fk_zc_plan_review_care_plan"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 3. Triggers -->
+    <changeSet id="20260929-09-11" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_care_plan'::regclass AND tgname IN ('trg_zc_care_plan_approval_immutable', 'trg_zc_care_plan_pins', 'trg_zc_care_plan_touch')</sqlCheck>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('zc_care_plan_approval_immutable')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_care_plan.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Care plan approval can't be changed once set.
+CREATE FUNCTION zc_care_plan_approval_immutable() RETURNS trigger
+  LANGUAGE plpgsql
+AS $fn$
+BEGIN
+  IF OLD.approved_at IS NOT NULL
+     AND (NEW.approved_by IS DISTINCT FROM OLD.approved_by
+          OR NEW.approved_at IS DISTINCT FROM OLD.approved_at) THEN
+    RAISE EXCEPTION 'trg_zc_care_plan_approval_immutable: the recorded approval of care plan % cannot be rewritten', OLD.id
+      USING ERRCODE = 'integrity_constraint_violation',
+            CONSTRAINT = 'trg_zc_care_plan_approval_immutable', TABLE = TG_TABLE_NAME;
+  END IF;
+  IF OLD.activated_at IS NOT NULL AND NEW.activated_at IS DISTINCT FROM OLD.activated_at THEN
+    RAISE EXCEPTION 'trg_zc_care_plan_approval_immutable: activated_at of care plan % cannot be rewritten', OLD.id
+      USING ERRCODE = 'integrity_constraint_violation',
+            CONSTRAINT = 'trg_zc_care_plan_approval_immutable', TABLE = TG_TABLE_NAME;
+  END IF;
+  RETURN NEW;
+END
+$fn$;
+
+CREATE TRIGGER trg_zc_care_plan_approval_immutable
+  BEFORE UPDATE ON zc_care_plan
+  FOR EACH ROW EXECUTE FUNCTION zc_care_plan_approval_immutable();
+CREATE TRIGGER trg_zc_care_plan_pins
+  BEFORE UPDATE ON zc_care_plan
+  FOR EACH ROW EXECUTE FUNCTION zc_forbid_pinned_change(
+    'trg_zc_care_plan_pins', 'enrolment_id', 'programme_version_id', 'supersedes_plan_id', 'version_number');
+CREATE TRIGGER trg_zc_care_plan_touch BEFORE UPDATE ON zc_care_plan FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_care_plan_approval_immutable ON zc_care_plan;
+DROP TRIGGER trg_zc_care_plan_pins ON zc_care_plan;
+DROP TRIGGER trg_zc_care_plan_touch ON zc_care_plan;
+DROP FUNCTION zc_care_plan_approval_immutable();
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-09-12" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_goal'::regclass AND tgname IN ('trg_zc_goal_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_goal.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_goal_touch BEFORE UPDATE ON zc_goal FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_goal_touch ON zc_goal;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-09-13" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_intervention'::regclass AND tgname IN ('trg_zc_intervention_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_intervention.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_intervention_touch BEFORE UPDATE ON zc_intervention FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_intervention_touch ON zc_intervention;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-09-14" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_care_plan_link'::regclass AND tgname IN ('trg_zc_care_plan_link_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_care_plan_link.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_care_plan_link_touch BEFORE UPDATE ON zc_care_plan_link FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_care_plan_link_touch ON zc_care_plan_link;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-09-15" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_plan_review'::regclass AND tgname IN ('trg_zc_plan_review_append_only', 'trg_zc_plan_review_no_truncate')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_plan_review.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_plan_review_append_only BEFORE UPDATE OR DELETE ON zc_plan_review FOR EACH ROW EXECUTE FUNCTION zc_forbid_change('trg_zc_plan_review_append_only');
+CREATE TRIGGER trg_zc_plan_review_no_truncate BEFORE TRUNCATE ON zc_plan_review FOR EACH STATEMENT EXECUTE FUNCTION zc_forbid_change('trg_zc_plan_review_append_only');
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_plan_review_append_only ON zc_plan_review;
+DROP TRIGGER trg_zc_plan_review_no_truncate ON zc_plan_review;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 4. Tenant isolation (row-level security) -->
+    <changeSet id="20260929-09-16" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_policy WHERE polname IN ('rls_zc_care_plan_tenant', 'rls_zc_goal_tenant', 'rls_zc_intervention_tenant', 'rls_zc_care_plan_link_tenant', 'rls_zc_plan_review_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Enable and force row-level security, with a tenant policy, on zc_care_plan, zc_goal, zc_intervention, zc_care_plan_link, zc_plan_review.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Tenant isolation. The app must connect as zc_app: superusers bypass RLS.
+ALTER TABLE zc_care_plan ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_care_plan FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_care_plan_tenant ON zc_care_plan
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_goal ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_goal FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_goal_tenant ON zc_goal
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_intervention ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_intervention FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_intervention_tenant ON zc_intervention
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_care_plan_link ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_care_plan_link FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_care_plan_link_tenant ON zc_care_plan_link
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_plan_review ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_plan_review FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_plan_review_tenant ON zc_plan_review
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP POLICY rls_zc_care_plan_tenant ON zc_care_plan;
+ALTER TABLE zc_care_plan NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_care_plan DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_goal_tenant ON zc_goal;
+ALTER TABLE zc_goal NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_goal DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_intervention_tenant ON zc_intervention;
+ALTER TABLE zc_intervention NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_intervention DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_care_plan_link_tenant ON zc_care_plan_link;
+ALTER TABLE zc_care_plan_link NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_care_plan_link DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_plan_review_tenant ON zc_plan_review;
+ALTER TABLE zc_plan_review NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_plan_review DISABLE ROW LEVEL SECURITY;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 5. Privileges for zc_app and zc_housekeeping -->
+    <changeSet id="20260929-09-17" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="2">SELECT count(*) FROM pg_roles WHERE rolname IN ('zc_app', 'zc_housekeeping')</sqlCheck>
+        </preConditions>
+        <comment>Grant the application privileges on the careplan tables; append-only tables get no UPDATE, and no table gets DELETE.</comment>
+        <sql splitStatements="false"><![CDATA[
+GRANT SELECT, INSERT, UPDATE ON zc_care_plan TO zc_app;
+GRANT USAGE ON SEQUENCE zc_care_plan_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_goal TO zc_app;
+GRANT USAGE ON SEQUENCE zc_goal_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_intervention TO zc_app;
+GRANT USAGE ON SEQUENCE zc_intervention_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_care_plan_link TO zc_app;
+GRANT USAGE ON SEQUENCE zc_care_plan_link_id_seq TO zc_app;
+GRANT SELECT, INSERT ON zc_plan_review TO zc_app;
+REVOKE UPDATE, DELETE, TRUNCATE ON zc_plan_review FROM zc_app;
+GRANT USAGE ON SEQUENCE zc_plan_review_id_seq TO zc_app;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+REVOKE ALL ON zc_care_plan FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_care_plan_id_seq FROM zc_app;
+REVOKE ALL ON zc_goal FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_goal_id_seq FROM zc_app;
+REVOKE ALL ON zc_intervention FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_intervention_id_seq FROM zc_app;
+REVOKE ALL ON zc_care_plan_link FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_care_plan_link_id_seq FROM zc_app;
+REVOKE ALL ON zc_plan_review FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_plan_review_id_seq FROM zc_app;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+</databaseChangeLog>

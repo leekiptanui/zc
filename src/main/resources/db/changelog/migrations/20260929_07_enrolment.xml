@@ -1,0 +1,365 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- 20260929_07_enrolment.xml -->
+    <!-- Enrolment, Consent and Preferences: the enrolment aggregate root, the ZCare-owned consent
+         record and member contact preferences. -->
+    <!-- Owned by the enrolment domain: com.zimasahealth.zcare.domains.enrolment (roadmap milestone M7). -->
+    <!-- Source: agreed design V001 section 05 and V002 grants. Author: adam16wilson7136 -->
+
+    <!-- 1. Tables, with their keys, checks, indexes and comments -->
+    <changeSet id="20260929-07-01" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_enrolment"/></not>
+        </preConditions>
+        <comment>Create table zc_enrolment.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_enrolment (
+  id                       bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id                bigint NOT NULL,
+  member_id                bigint NOT NULL,
+  programme_id             bigint NOT NULL,
+  programme_version_id     bigint NOT NULL,
+  cohort_membership_id     bigint,
+  supersedes_enrolment_id  bigint,
+  status                   text NOT NULL DEFAULT 'invited',
+  invited_at               timestamptz NOT NULL DEFAULT now(),
+  activated_at             timestamptz,
+  responsible_cm           text,
+  exited_at                timestamptz,
+  exit_reason              text,
+  eligibility_snapshot     jsonb,
+  eligibility_source_date  date,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_enrolment_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_enrolment_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_enrolment PRIMARY KEY (id),
+  CONSTRAINT uq_zc_enrolment_fk_target         UNIQUE (tenant_id, id),
+  CONSTRAINT uq_zc_enrolment_fk_member         UNIQUE (tenant_id, id, member_id),
+  CONSTRAINT uq_zc_enrolment_fk_version        UNIQUE (tenant_id, id, programme_version_id),
+  CONSTRAINT uq_zc_enrolment_fk_version_member UNIQUE (tenant_id, id, programme_version_id, member_id),
+  CONSTRAINT ck_zc_enrolment_status CHECK (status IN ('invited','active','suspended','completed','withdrawn')),
+  CONSTRAINT ck_zc_enrolment_active_evidence CHECK (
+    status <> 'active' OR (activated_at IS NOT NULL AND nullif(btrim(responsible_cm), '') IS NOT NULL)),
+  CONSTRAINT ck_zc_enrolment_exit_evidence CHECK (
+    status NOT IN ('completed','withdrawn') OR (exited_at IS NOT NULL AND nullif(btrim(exit_reason), '') IS NOT NULL)),
+  CONSTRAINT ck_zc_enrolment_not_self_superseding CHECK (supersedes_enrolment_id IS NULL OR supersedes_enrolment_id <> id)
+);
+COMMENT ON TABLE zc_enrolment IS
+  'Aggregate root: accountable participation of one member in one programme. programme_version_id is pinned at invitation and immutable (trg_zc_enrolment_pins).';
+COMMENT ON COLUMN zc_enrolment.eligibility_snapshot IS
+  'jsonb: cached, NON-authoritative copy of the payer eligibility envelope at invitation time. Displayed, never searched, never indexed.';
+-- One live enrolment per member + programme ('invited' counts as live).
+CREATE UNIQUE INDEX uq_zc_enrolment_one_active
+  ON zc_enrolment (tenant_id, member_id, programme_id)
+  WHERE status IN ('invited','active','suspended');
+CREATE INDEX ix_zc_enrolment_caseload ON zc_enrolment (tenant_id, responsible_cm, status);
+CREATE INDEX ix_zc_enrolment_programme_version ON zc_enrolment (tenant_id, programme_version_id, status);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_enrolment"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-07-02" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_consent_record"/></not>
+        </preConditions>
+        <comment>Create table zc_consent_record.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_consent_record (
+  id                      bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id               bigint NOT NULL,
+  enrolment_id            bigint NOT NULL,
+  member_id               bigint NOT NULL,
+  status                  text NOT NULL DEFAULT 'captured',
+  wording_version         text NOT NULL,   -- no fixed list yet
+  channel                 text NOT NULL,
+  scope_content_classes   text[] NOT NULL,
+  scope_sharing_purposes  text[] NOT NULL DEFAULT '{}',
+  captured_at             timestamptz NOT NULL DEFAULT now(),
+  captured_by             text NOT NULL,
+  evidence_ref            text,
+  validated_by            text,
+  validated_at            timestamptz,
+  revoked_at              timestamptz,
+  revocation_channel      text,
+  revocation_verbatim     text,
+  superseded_at           timestamptz,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_consent_record_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_consent_record_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_consent_record PRIMARY KEY (id),
+  CONSTRAINT ck_zc_consent_record_status CHECK (
+    status IN ('captured','validated','revoked','scope_reduced','superseded')),
+  CONSTRAINT ck_zc_consent_record_wording_version CHECK (btrim(wording_version) <> ''),
+  CONSTRAINT ck_zc_consent_record_channel CHECK (btrim(channel) <> ''),
+  CONSTRAINT ck_zc_consent_record_captured_by CHECK (btrim(captured_by) <> ''),
+  CONSTRAINT ck_zc_consent_record_scope CHECK (
+    cardinality(scope_content_classes) >= 1
+    AND scope_content_classes <@ ARRAY['condition_neutral','health_content']::text[]),
+  CONSTRAINT ck_zc_consent_record_purposes CHECK (array_position(scope_sharing_purposes, NULL) IS NULL),
+  CONSTRAINT ck_zc_consent_record_validated CHECK (
+    status <> 'validated' OR (nullif(btrim(validated_by), '') IS NOT NULL AND validated_at IS NOT NULL)),
+  CONSTRAINT ck_zc_consent_record_validation_pair CHECK ((validated_by IS NULL) = (validated_at IS NULL)),
+  CONSTRAINT ck_zc_consent_record_revoked CHECK (
+    status <> 'revoked'
+    OR (revoked_at IS NOT NULL
+        AND nullif(btrim(revocation_channel), '') IS NOT NULL
+        AND nullif(btrim(revocation_verbatim), '') IS NOT NULL)),
+  CONSTRAINT ck_zc_consent_record_superseded CHECK (status <> 'superseded' OR superseded_at IS NOT NULL)
+);
+COMMENT ON TABLE zc_consent_record IS
+  'ZCare-owned consent (ADR-002). The DB makes the consent gate CHECKABLE; the gate itself is enforced at command, dispatch and query layers (04D 9.4 - residual risk).';
+-- One consent in force per enrolment.
+CREATE UNIQUE INDEX uq_zc_consent_record_in_force
+  ON zc_consent_record (tenant_id, enrolment_id)
+  WHERE status IN ('captured','validated','scope_reduced');
+CREATE INDEX ix_zc_consent_record_member ON zc_consent_record (tenant_id, member_id, status);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_consent_record"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-07-03" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_member_preference"/></not>
+        </preConditions>
+        <comment>Create table zc_member_preference.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_member_preference (
+  id                     bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id              bigint NOT NULL,
+  member_id              bigint NOT NULL,
+  do_not_contact         boolean NOT NULL DEFAULT false,
+  do_not_contact_reason  text,
+  do_not_contact_at      timestamptz,
+  preferred_channel      text,
+  preferred_language     text,
+  contact_window_start   time,
+  contact_window_end     time,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_member_preference_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_member_preference_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_member_preference PRIMARY KEY (id),
+  CONSTRAINT uq_zc_member_preference_member UNIQUE (tenant_id, member_id),
+  CONSTRAINT ck_zc_member_preference_dnc_evidence CHECK (
+    NOT do_not_contact
+    OR (nullif(btrim(do_not_contact_reason), '') IS NOT NULL AND do_not_contact_at IS NOT NULL)),
+  CONSTRAINT ck_zc_member_preference_window CHECK ((contact_window_start IS NULL) = (contact_window_end IS NULL))
+);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_member_preference"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 2. Foreign keys, after every referenced table exists -->
+    <changeSet id="20260929-07-04" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_member_reference"/>
+            <tableExists schemaName="public" tableName="zc_programme"/>
+            <tableExists schemaName="public" tableName="zc_programme_version"/>
+            <tableExists schemaName="public" tableName="zc_cohort_membership"/>
+            <tableExists schemaName="public" tableName="zc_enrolment"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_enrolment'::regclass AND conname IN ('fk_zc_enrolment_tenant', 'fk_zc_enrolment_member', 'fk_zc_enrolment_programme', 'fk_zc_enrolment_programme_version', 'fk_zc_enrolment_cohort_membership', 'fk_zc_enrolment_supersedes')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_enrolment.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_enrolment
+  ADD CONSTRAINT fk_zc_enrolment_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_enrolment
+  ADD CONSTRAINT fk_zc_enrolment_member FOREIGN KEY (tenant_id, member_id)
+    REFERENCES zc_member_reference (tenant_id, id);
+ALTER TABLE zc_enrolment
+  ADD CONSTRAINT fk_zc_enrolment_programme FOREIGN KEY (tenant_id, programme_id)
+    REFERENCES zc_programme (tenant_id, id);
+-- Version must belong to the enrolled programme.
+ALTER TABLE zc_enrolment
+  ADD CONSTRAINT fk_zc_enrolment_programme_version FOREIGN KEY (tenant_id, programme_version_id, programme_id)
+    REFERENCES zc_programme_version (tenant_id, id, programme_id);
+ALTER TABLE zc_enrolment
+  ADD CONSTRAINT fk_zc_enrolment_cohort_membership FOREIGN KEY (tenant_id, cohort_membership_id, member_id)
+    REFERENCES zc_cohort_membership (tenant_id, id, member_id);
+ALTER TABLE zc_enrolment
+  ADD CONSTRAINT fk_zc_enrolment_supersedes FOREIGN KEY (tenant_id, supersedes_enrolment_id, member_id)
+    REFERENCES zc_enrolment (tenant_id, id, member_id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_enrolment" constraintName="fk_zc_enrolment_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_enrolment" constraintName="fk_zc_enrolment_member"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_enrolment" constraintName="fk_zc_enrolment_programme"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_enrolment" constraintName="fk_zc_enrolment_programme_version"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_enrolment" constraintName="fk_zc_enrolment_cohort_membership"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_enrolment" constraintName="fk_zc_enrolment_supersedes"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-07-05" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_enrolment"/>
+            <tableExists schemaName="public" tableName="zc_member_reference"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_consent_record'::regclass AND conname IN ('fk_zc_consent_record_tenant', 'fk_zc_consent_record_enrolment', 'fk_zc_consent_record_member')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_consent_record.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_consent_record
+  ADD CONSTRAINT fk_zc_consent_record_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+-- Consent member must match the enrolment member.
+ALTER TABLE zc_consent_record
+  ADD CONSTRAINT fk_zc_consent_record_enrolment FOREIGN KEY (tenant_id, enrolment_id, member_id)
+    REFERENCES zc_enrolment (tenant_id, id, member_id);
+ALTER TABLE zc_consent_record
+  ADD CONSTRAINT fk_zc_consent_record_member FOREIGN KEY (tenant_id, member_id)
+    REFERENCES zc_member_reference (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_consent_record" constraintName="fk_zc_consent_record_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_consent_record" constraintName="fk_zc_consent_record_enrolment"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_consent_record" constraintName="fk_zc_consent_record_member"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-07-06" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_member_reference"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_member_preference'::regclass AND conname IN ('fk_zc_member_preference_tenant', 'fk_zc_member_preference_member')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_member_preference.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_member_preference
+  ADD CONSTRAINT fk_zc_member_preference_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_member_preference
+  ADD CONSTRAINT fk_zc_member_preference_member FOREIGN KEY (tenant_id, member_id)
+    REFERENCES zc_member_reference (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_member_preference" constraintName="fk_zc_member_preference_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_member_preference" constraintName="fk_zc_member_preference_member"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 3. Triggers -->
+    <changeSet id="20260929-07-07" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_enrolment'::regclass AND tgname IN ('trg_zc_enrolment_pins', 'trg_zc_enrolment_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_enrolment.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_enrolment_pins
+  BEFORE UPDATE ON zc_enrolment
+  FOR EACH ROW EXECUTE FUNCTION zc_forbid_pinned_change(
+    'trg_zc_enrolment_pins', 'member_id', 'programme_id', 'programme_version_id');
+CREATE TRIGGER trg_zc_enrolment_touch BEFORE UPDATE ON zc_enrolment FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_enrolment_pins ON zc_enrolment;
+DROP TRIGGER trg_zc_enrolment_touch ON zc_enrolment;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-07-08" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_consent_record'::regclass AND tgname IN ('trg_zc_consent_record_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_consent_record.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_consent_record_touch BEFORE UPDATE ON zc_consent_record FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_consent_record_touch ON zc_consent_record;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-07-09" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_member_preference'::regclass AND tgname IN ('trg_zc_member_preference_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_member_preference.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_member_preference_touch BEFORE UPDATE ON zc_member_preference FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_member_preference_touch ON zc_member_preference;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 4. Tenant isolation (row-level security) -->
+    <changeSet id="20260929-07-10" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_policy WHERE polname IN ('rls_zc_enrolment_tenant', 'rls_zc_consent_record_tenant', 'rls_zc_member_preference_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Enable and force row-level security, with a tenant policy, on zc_enrolment, zc_consent_record, zc_member_preference.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Tenant isolation. The app must connect as zc_app: superusers bypass RLS.
+ALTER TABLE zc_enrolment ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_enrolment FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_enrolment_tenant ON zc_enrolment
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_consent_record ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_consent_record FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_consent_record_tenant ON zc_consent_record
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_member_preference ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_member_preference FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_member_preference_tenant ON zc_member_preference
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP POLICY rls_zc_enrolment_tenant ON zc_enrolment;
+ALTER TABLE zc_enrolment NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_enrolment DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_consent_record_tenant ON zc_consent_record;
+ALTER TABLE zc_consent_record NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_consent_record DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_member_preference_tenant ON zc_member_preference;
+ALTER TABLE zc_member_preference NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_member_preference DISABLE ROW LEVEL SECURITY;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 5. Privileges for zc_app and zc_housekeeping -->
+    <changeSet id="20260929-07-11" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="2">SELECT count(*) FROM pg_roles WHERE rolname IN ('zc_app', 'zc_housekeeping')</sqlCheck>
+        </preConditions>
+        <comment>Grant the application privileges on the enrolment tables; append-only tables get no UPDATE, and no table gets DELETE.</comment>
+        <sql splitStatements="false"><![CDATA[
+GRANT SELECT, INSERT, UPDATE ON zc_enrolment TO zc_app;
+GRANT USAGE ON SEQUENCE zc_enrolment_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_consent_record TO zc_app;
+GRANT USAGE ON SEQUENCE zc_consent_record_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_member_preference TO zc_app;
+GRANT USAGE ON SEQUENCE zc_member_preference_id_seq TO zc_app;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+REVOKE ALL ON zc_enrolment FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_enrolment_id_seq FROM zc_app;
+REVOKE ALL ON zc_consent_record FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_consent_record_id_seq FROM zc_app;
+REVOKE ALL ON zc_member_preference FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_member_preference_id_seq FROM zc_app;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+</databaseChangeLog>

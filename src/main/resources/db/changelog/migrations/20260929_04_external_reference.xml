@@ -1,0 +1,208 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- 20260929_04_external_reference.xml -->
+    <!-- External References: the minimum-copy boundary for people and external identifiers; every
+         copy is pinned non-authoritative. -->
+    <!-- Owned by the reference domain: com.zimasahealth.zcare.domains.reference (roadmap milestone M5). -->
+    <!-- Source: agreed design V001 section 02 and V002 grants. Author: adam16wilson7136 -->
+
+    <!-- 1. Tables, with their keys, checks, indexes and comments -->
+    <changeSet id="20260929-04-01" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_member_reference"/></not>
+        </preConditions>
+        <comment>Create table zc_member_reference.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_member_reference (
+  id                     bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id              bigint NOT NULL,
+  source_system          text NOT NULL,   -- free text from adapter
+  source_member_number   text NOT NULL,   -- may be household-level
+  source_individual_ref  text NOT NULL,   -- identifies the person in the household
+  display_name           text,
+  contact_msisdn         text,
+  source_date            date NOT NULL,
+  is_authoritative       boolean NOT NULL DEFAULT false,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_member_reference_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_member_reference_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_member_reference PRIMARY KEY (id),
+  CONSTRAINT uq_zc_member_reference_fk_target UNIQUE (tenant_id, id),
+  CONSTRAINT uq_zc_member_reference_individual
+    UNIQUE (tenant_id, source_system, source_member_number, source_individual_ref),
+  CONSTRAINT ck_zc_member_reference_non_auth CHECK (is_authoritative = false),
+  CONSTRAINT ck_zc_member_reference_source_system CHECK (btrim(source_system) <> ''),
+  CONSTRAINT ck_zc_member_reference_member_number CHECK (btrim(source_member_number) <> ''),
+  CONSTRAINT ck_zc_member_reference_individual    CHECK (btrim(source_individual_ref) <> ''),
+  CONSTRAINT ck_zc_member_reference_msisdn CHECK (contact_msisdn IS NULL OR contact_msisdn ~ '^\+?[1-9][0-9]{6,14}$')
+);
+COMMENT ON TABLE zc_member_reference IS
+  'Minimum reference to a person, resolved to an individual. NOT a member master. is_authoritative is CHECK-pinned false so a copy can never be promoted to truth.';
+CREATE INDEX ix_zc_member_reference_msisdn ON zc_member_reference (tenant_id, contact_msisdn)
+  WHERE contact_msisdn IS NOT NULL;
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_member_reference"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-04-02" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_external_reference"/></not>
+        </preConditions>
+        <comment>Create table zc_external_reference.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_external_reference (
+  id                bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id         bigint NOT NULL,
+  entity_type       text NOT NULL,
+  entity_id         bigint NOT NULL, -- polymorphic, no FK
+  system_code       text NOT NULL,   -- free text from adapter
+  code_system       text,
+  external_id       text NOT NULL,
+  source_date       date,
+  is_authoritative  boolean NOT NULL DEFAULT false,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_external_reference_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_external_reference_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_external_reference PRIMARY KEY (id),
+  CONSTRAINT uq_zc_external_reference_mapping UNIQUE NULLS NOT DISTINCT
+    (tenant_id, entity_type, entity_id, system_code, code_system),
+  CONSTRAINT ck_zc_external_reference_non_auth CHECK (is_authoritative = false),
+  CONSTRAINT ck_zc_external_reference_entity_type CHECK (entity_type IN (
+    'member_reference','organisation','enrolment','care_plan','goal','task','referral',
+    'transition','medication_coordination','refill_request','observation','care_gap',
+    'assessment','consent_record','provider_participation','outcome_observation')),
+  CONSTRAINT ck_zc_external_reference_system_code CHECK (btrim(system_code) <> ''),
+  CONSTRAINT ck_zc_external_reference_external_id CHECK (btrim(external_id) <> '')
+);
+COMMENT ON TABLE zc_external_reference IS
+  'General map from a ZCare entity to an external identifier (provider, lab, pharmacy, FHIR). entity_id is polymorphic by design; the entity_type CHECK carries the meaning.';
+CREATE INDEX ix_zc_external_reference_lookup ON zc_external_reference (tenant_id, system_code, external_id);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_external_reference"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 2. Foreign keys, after every referenced table exists -->
+    <changeSet id="20260929-04-03" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_member_reference'::regclass AND conname IN ('fk_zc_member_reference_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_member_reference.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_member_reference
+  ADD CONSTRAINT fk_zc_member_reference_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_member_reference" constraintName="fk_zc_member_reference_tenant"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-04-04" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_external_reference'::regclass AND conname IN ('fk_zc_external_reference_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_external_reference.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_external_reference
+  ADD CONSTRAINT fk_zc_external_reference_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_external_reference" constraintName="fk_zc_external_reference_tenant"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 3. Triggers -->
+    <changeSet id="20260929-04-05" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_member_reference'::regclass AND tgname IN ('trg_zc_member_reference_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_member_reference.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_member_reference_touch BEFORE UPDATE ON zc_member_reference FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_member_reference_touch ON zc_member_reference;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-04-06" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_external_reference'::regclass AND tgname IN ('trg_zc_external_reference_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_external_reference.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_external_reference_touch BEFORE UPDATE ON zc_external_reference FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_external_reference_touch ON zc_external_reference;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 4. Tenant isolation (row-level security) -->
+    <changeSet id="20260929-04-07" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_policy WHERE polname IN ('rls_zc_member_reference_tenant', 'rls_zc_external_reference_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Enable and force row-level security, with a tenant policy, on zc_member_reference, zc_external_reference.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Tenant isolation. The app must connect as zc_app: superusers bypass RLS.
+ALTER TABLE zc_member_reference ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_member_reference FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_member_reference_tenant ON zc_member_reference
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_external_reference ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_external_reference FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_external_reference_tenant ON zc_external_reference
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP POLICY rls_zc_member_reference_tenant ON zc_member_reference;
+ALTER TABLE zc_member_reference NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_member_reference DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_external_reference_tenant ON zc_external_reference;
+ALTER TABLE zc_external_reference NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_external_reference DISABLE ROW LEVEL SECURITY;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 5. Privileges for zc_app and zc_housekeeping -->
+    <changeSet id="20260929-04-08" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="2">SELECT count(*) FROM pg_roles WHERE rolname IN ('zc_app', 'zc_housekeeping')</sqlCheck>
+        </preConditions>
+        <comment>Grant the application privileges on the external reference tables; append-only tables get no UPDATE, and no table gets DELETE.</comment>
+        <sql splitStatements="false"><![CDATA[
+GRANT SELECT, INSERT, UPDATE ON zc_member_reference TO zc_app;
+GRANT USAGE ON SEQUENCE zc_member_reference_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_external_reference TO zc_app;
+GRANT USAGE ON SEQUENCE zc_external_reference_id_seq TO zc_app;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+REVOKE ALL ON zc_member_reference FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_member_reference_id_seq FROM zc_app;
+REVOKE ALL ON zc_external_reference FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_external_reference_id_seq FROM zc_app;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+</databaseChangeLog>

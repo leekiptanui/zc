@@ -1,0 +1,833 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- 20260929_05_programme.xml -->
+    <!-- Programme Management: programmes, immutable published versions, assessment templates, gap
+         rules, task templates and the programme-scoped clinical vocabulary. -->
+    <!-- Owned by the programme domain: com.zimasahealth.zcare.domains.programme (roadmap milestone M4). -->
+    <!-- Source: agreed design V001 sections 03 and 3a, and V002 grants. Author: adam16wilson7136 -->
+
+    <!-- 1. Tables, with their keys, checks, indexes and comments -->
+    <changeSet id="20260929-05-01" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_programme"/></not>
+        </preConditions>
+        <comment>Create table zc_programme.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_programme (
+  id           bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id    bigint NOT NULL,
+  code         text NOT NULL,
+  name         text NOT NULL,
+  care_model   text NOT NULL,
+  status       text NOT NULL DEFAULT 'draft',
+  description  text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_programme_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_programme_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_programme PRIMARY KEY (id),
+  CONSTRAINT uq_zc_programme_fk_target UNIQUE (tenant_id, id),
+  CONSTRAINT uq_zc_programme_code UNIQUE (tenant_id, code),
+  CONSTRAINT ck_zc_programme_code   CHECK (btrim(code) <> ''),
+  CONSTRAINT ck_zc_programme_name   CHECK (btrim(name) <> ''),
+  CONSTRAINT ck_zc_programme_status CHECK (status IN ('draft','active','suspended','retired')),
+  -- TODO: replace with the 13 approved care models (PRD 7.5).
+  CONSTRAINT ck_zc_programme_care_model CHECK (btrim(care_model) <> '')
+);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_programme"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-02" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_programme_version"/></not>
+        </preConditions>
+        <comment>Create table zc_programme_version.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_programme_version (
+  id                    bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id             bigint NOT NULL,
+  programme_id          bigint NOT NULL,
+  version_number        integer NOT NULL,
+  status                text NOT NULL DEFAULT 'draft',
+  content               jsonb,
+  clinical_approved_by  text,
+  clinical_approved_at  timestamptz,
+  published_at          timestamptz,
+  retired_at            timestamptz,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_programme_version_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_programme_version_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_programme_version PRIMARY KEY (id),
+  CONSTRAINT uq_zc_programme_version_fk_target    UNIQUE (tenant_id, id),
+  CONSTRAINT uq_zc_programme_version_fk_programme UNIQUE (tenant_id, id, programme_id),
+  CONSTRAINT uq_zc_programme_version_number UNIQUE (tenant_id, programme_id, version_number),
+  CONSTRAINT ck_zc_programme_version_number CHECK (version_number > 0),
+  CONSTRAINT ck_zc_programme_version_status CHECK (status IN ('draft','pending_approval','published','retired')),
+  CONSTRAINT ck_zc_programme_version_publication CHECK (
+    status <> 'published'
+    OR (nullif(btrim(clinical_approved_by), '') IS NOT NULL
+        AND clinical_approved_at IS NOT NULL
+        AND published_at IS NOT NULL)),
+  CONSTRAINT ck_zc_programme_version_published_approved CHECK (
+    published_at IS NULL OR (clinical_approved_by IS NOT NULL AND clinical_approved_at IS NOT NULL)),
+  CONSTRAINT ck_zc_programme_version_retired CHECK (status <> 'retired' OR retired_at IS NOT NULL)
+);
+COMMENT ON COLUMN zc_programme_version.content IS
+  'jsonb: programme content is an unresolved external dependency (Aga Khan clinical content package). No invariant is enforced inside it.';
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_programme_version"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-03" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_assessment_template"/></not>
+        </preConditions>
+        <comment>Create table zc_assessment_template.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_assessment_template (
+  id           bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id    bigint NOT NULL,
+  code         text NOT NULL,
+  name         text NOT NULL,
+  description  text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_assessment_template_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_assessment_template_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_assessment_template PRIMARY KEY (id),
+  CONSTRAINT uq_zc_assessment_template_fk_target UNIQUE (tenant_id, id),
+  CONSTRAINT uq_zc_assessment_template_code UNIQUE (tenant_id, code),
+  CONSTRAINT ck_zc_assessment_template_code CHECK (btrim(code) <> ''),
+  CONSTRAINT ck_zc_assessment_template_name CHECK (btrim(name) <> '')
+);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_assessment_template"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-04" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_assessment_template_version"/></not>
+        </preConditions>
+        <comment>Create table zc_assessment_template_version.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_assessment_template_version (
+  id              bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id       bigint NOT NULL,
+  template_id     bigint NOT NULL,
+  version_number  integer NOT NULL,
+  status          text NOT NULL DEFAULT 'draft',
+  questionnaire   jsonb NOT NULL,
+  scoring_rules   jsonb,
+  published_at    timestamptz,
+  retired_at      timestamptz,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_assessment_template_version_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_assessment_template_version_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_assessment_template_version PRIMARY KEY (id),
+  CONSTRAINT uq_zc_assessment_template_version_fk_target UNIQUE (tenant_id, id),
+  CONSTRAINT uq_zc_assessment_template_version_number UNIQUE (tenant_id, template_id, version_number),
+  CONSTRAINT ck_zc_assessment_template_version_number CHECK (version_number > 0),
+  CONSTRAINT ck_zc_assessment_template_version_status CHECK (status IN ('draft','published','retired')),
+  CONSTRAINT ck_zc_assessment_template_version_published CHECK (status <> 'published' OR published_at IS NOT NULL),
+  CONSTRAINT ck_zc_assessment_template_version_retired CHECK (status <> 'retired' OR retired_at IS NOT NULL)
+);
+COMMENT ON COLUMN zc_assessment_template_version.questionnaire IS
+  'jsonb: questionnaire content is an unresolved external dependency (clinical content package).';
+COMMENT ON COLUMN zc_assessment_template_version.scoring_rules IS
+  'jsonb: scoring rules are an unresolved external dependency (clinical content package).';
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_assessment_template_version"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-05" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_gap_rule"/></not>
+        </preConditions>
+        <comment>Create table zc_gap_rule.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_gap_rule (
+  id                    bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id             bigint NOT NULL,
+  programme_version_id  bigint NOT NULL,
+  gap_type              text NOT NULL,
+  rule_version          integer NOT NULL DEFAULT 1,
+  period_strategy       text NOT NULL,
+  definition            jsonb NOT NULL,
+  description           text,
+  is_active             boolean NOT NULL DEFAULT true,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_gap_rule_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_gap_rule_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_gap_rule PRIMARY KEY (id),
+  CONSTRAINT uq_zc_gap_rule_fk_target UNIQUE (tenant_id, id, programme_version_id, gap_type, rule_version),
+  CONSTRAINT uq_zc_gap_rule_version UNIQUE (tenant_id, programme_version_id, gap_type, rule_version),
+  CONSTRAINT ck_zc_gap_rule_gap_type CHECK (btrim(gap_type) <> ''),
+  CONSTRAINT ck_zc_gap_rule_rule_version CHECK (rule_version > 0),
+  CONSTRAINT ck_zc_gap_rule_period_strategy CHECK (btrim(period_strategy) <> '')
+);
+COMMENT ON COLUMN zc_gap_rule.definition IS
+  'jsonb: gap-rule definition and thresholds are an unresolved external dependency (clinical content package).';
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_gap_rule"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-06" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_task_template"/></not>
+        </preConditions>
+        <comment>Create table zc_task_template.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_task_template (
+  id                     bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id              bigint NOT NULL,
+  programme_version_id   bigint NOT NULL,
+  task_type              text NOT NULL,
+  name                   text NOT NULL,
+  description            text,
+  default_priority       smallint NOT NULL DEFAULT 3,
+  sla_hours              integer,
+  default_assignee_role  text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_task_template_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_task_template_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_task_template PRIMARY KEY (id),
+  CONSTRAINT uq_zc_task_template_type UNIQUE (tenant_id, programme_version_id, task_type),
+  CONSTRAINT ck_zc_task_template_task_type CHECK (btrim(task_type) <> ''),
+  CONSTRAINT ck_zc_task_template_name CHECK (btrim(name) <> ''),
+  CONSTRAINT ck_zc_task_template_priority CHECK (default_priority BETWEEN 1 AND 5),
+  CONSTRAINT ck_zc_task_template_sla CHECK (sla_hours IS NULL OR sla_hours > 0)
+);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_task_template"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-07" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_referral_type"/></not>
+        </preConditions>
+        <comment>Create table zc_referral_type.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_referral_type (
+  id                   bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id            bigint NOT NULL,
+  code                 text NOT NULL,
+  name                 text NOT NULL,
+  is_platform_defined  boolean NOT NULL DEFAULT false,
+  is_active            boolean NOT NULL DEFAULT true,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_referral_type_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_referral_type_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_referral_type PRIMARY KEY (id),
+  CONSTRAINT uq_zc_referral_type_fk_target UNIQUE (tenant_id, id),
+  CONSTRAINT uq_zc_referral_type_code UNIQUE (tenant_id, code),
+  CONSTRAINT ck_zc_referral_type_code CHECK (btrim(code) <> ''),
+  CONSTRAINT ck_zc_referral_type_name CHECK (btrim(name) <> '')
+);
+COMMENT ON TABLE zc_referral_type IS 'Tenant-scoped, not programme-scoped: any programme may use a referral type.';
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_referral_type"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-08" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_observation_type"/></not>
+        </preConditions>
+        <comment>Create table zc_observation_type.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_observation_type (
+  id                    bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id             bigint NOT NULL,
+  programme_version_id  bigint NOT NULL,
+  code                  text NOT NULL,
+  name                  text NOT NULL,
+  unit                  text NOT NULL,   -- UCUM; use '1' for unitless
+  loinc_code            text,
+  plausible_min         numeric,
+  plausible_max         numeric,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_observation_type_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_observation_type_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_observation_type PRIMARY KEY (id),
+  CONSTRAINT uq_zc_observation_type_fk_version UNIQUE (tenant_id, id, programme_version_id),
+  CONSTRAINT uq_zc_observation_type_fk_unit    UNIQUE (tenant_id, id, unit),
+  CONSTRAINT uq_zc_observation_type_code UNIQUE (tenant_id, programme_version_id, code),
+  CONSTRAINT ck_zc_observation_type_code CHECK (btrim(code) <> ''),
+  CONSTRAINT ck_zc_observation_type_name CHECK (btrim(name) <> ''),
+  CONSTRAINT ck_zc_observation_type_unit CHECK (btrim(unit) <> ''),
+  CONSTRAINT ck_zc_observation_type_plausible_range CHECK (
+    plausible_min IS NULL OR plausible_max IS NULL OR plausible_min <= plausible_max)
+);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_observation_type"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-09" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_goal_type"/></not>
+        </preConditions>
+        <comment>Create table zc_goal_type.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_goal_type (
+  id                    bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id             bigint NOT NULL,
+  programme_version_id  bigint NOT NULL,
+  code                  text NOT NULL,
+  name                  text NOT NULL,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_goal_type_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_goal_type_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_goal_type PRIMARY KEY (id),
+  CONSTRAINT uq_zc_goal_type_fk_version UNIQUE (tenant_id, id, programme_version_id),
+  CONSTRAINT uq_zc_goal_type_code UNIQUE (tenant_id, programme_version_id, code),
+  CONSTRAINT ck_zc_goal_type_code CHECK (btrim(code) <> ''),
+  CONSTRAINT ck_zc_goal_type_name CHECK (btrim(name) <> '')
+);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_goal_type"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-10" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_outcome_definition"/></not>
+        </preConditions>
+        <comment>Create table zc_outcome_definition.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_outcome_definition (
+  id                    bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id             bigint NOT NULL,
+  programme_version_id  bigint NOT NULL,
+  measure_code          text NOT NULL,
+  measure_version       integer NOT NULL DEFAULT 1,
+  name                  text NOT NULL,
+  category              text NOT NULL,
+  definition            jsonb NOT NULL,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_outcome_definition_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_outcome_definition_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_outcome_definition PRIMARY KEY (id),
+  CONSTRAINT uq_zc_outcome_definition_fk_version UNIQUE (tenant_id, id, measure_version),
+  CONSTRAINT uq_zc_outcome_definition_measure UNIQUE (tenant_id, programme_version_id, measure_code, measure_version),
+  CONSTRAINT ck_zc_outcome_definition_measure_code CHECK (btrim(measure_code) <> ''),
+  CONSTRAINT ck_zc_outcome_definition_measure_version CHECK (measure_version > 0),
+  CONSTRAINT ck_zc_outcome_definition_name CHECK (btrim(name) <> ''),
+  CONSTRAINT ck_zc_outcome_definition_category CHECK (btrim(category) <> '')
+);
+COMMENT ON COLUMN zc_outcome_definition.definition IS
+  'jsonb: outcome measure definitions are configuration pending the clinical content package.';
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_outcome_definition"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 2. Foreign keys, after every referenced table exists -->
+    <changeSet id="20260929-05-11" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_programme'::regclass AND conname IN ('fk_zc_programme_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_programme.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_programme
+  ADD CONSTRAINT fk_zc_programme_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_programme" constraintName="fk_zc_programme_tenant"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-12" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_programme"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_programme_version'::regclass AND conname IN ('fk_zc_programme_version_tenant', 'fk_zc_programme_version_programme')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_programme_version.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_programme_version
+  ADD CONSTRAINT fk_zc_programme_version_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_programme_version
+  ADD CONSTRAINT fk_zc_programme_version_programme FOREIGN KEY (tenant_id, programme_id)
+    REFERENCES zc_programme (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_programme_version" constraintName="fk_zc_programme_version_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_programme_version" constraintName="fk_zc_programme_version_programme"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-13" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_assessment_template'::regclass AND conname IN ('fk_zc_assessment_template_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_assessment_template.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_assessment_template
+  ADD CONSTRAINT fk_zc_assessment_template_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_assessment_template" constraintName="fk_zc_assessment_template_tenant"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-14" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_assessment_template"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_assessment_template_version'::regclass AND conname IN ('fk_zc_assessment_template_version_tenant', 'fk_zc_assessment_template_version_template')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_assessment_template_version.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_assessment_template_version
+  ADD CONSTRAINT fk_zc_assessment_template_version_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_assessment_template_version
+  ADD CONSTRAINT fk_zc_assessment_template_version_template FOREIGN KEY (tenant_id, template_id)
+    REFERENCES zc_assessment_template (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_assessment_template_version" constraintName="fk_zc_assessment_template_version_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_assessment_template_version" constraintName="fk_zc_assessment_template_version_template"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-15" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_programme_version"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_gap_rule'::regclass AND conname IN ('fk_zc_gap_rule_tenant', 'fk_zc_gap_rule_programme_version')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_gap_rule.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_gap_rule
+  ADD CONSTRAINT fk_zc_gap_rule_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_gap_rule
+  ADD CONSTRAINT fk_zc_gap_rule_programme_version FOREIGN KEY (tenant_id, programme_version_id)
+    REFERENCES zc_programme_version (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_gap_rule" constraintName="fk_zc_gap_rule_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_gap_rule" constraintName="fk_zc_gap_rule_programme_version"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-16" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_programme_version"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_task_template'::regclass AND conname IN ('fk_zc_task_template_tenant', 'fk_zc_task_template_programme_version')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_task_template.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_task_template
+  ADD CONSTRAINT fk_zc_task_template_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_task_template
+  ADD CONSTRAINT fk_zc_task_template_programme_version FOREIGN KEY (tenant_id, programme_version_id)
+    REFERENCES zc_programme_version (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_task_template" constraintName="fk_zc_task_template_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_task_template" constraintName="fk_zc_task_template_programme_version"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-17" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_referral_type'::regclass AND conname IN ('fk_zc_referral_type_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_referral_type.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_referral_type
+  ADD CONSTRAINT fk_zc_referral_type_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_referral_type" constraintName="fk_zc_referral_type_tenant"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-18" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_programme_version"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_observation_type'::regclass AND conname IN ('fk_zc_observation_type_tenant', 'fk_zc_observation_type_programme_version')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_observation_type.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_observation_type
+  ADD CONSTRAINT fk_zc_observation_type_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_observation_type
+  ADD CONSTRAINT fk_zc_observation_type_programme_version FOREIGN KEY (tenant_id, programme_version_id)
+    REFERENCES zc_programme_version (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_observation_type" constraintName="fk_zc_observation_type_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_observation_type" constraintName="fk_zc_observation_type_programme_version"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-19" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_programme_version"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_goal_type'::regclass AND conname IN ('fk_zc_goal_type_tenant', 'fk_zc_goal_type_programme_version')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_goal_type.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_goal_type
+  ADD CONSTRAINT fk_zc_goal_type_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_goal_type
+  ADD CONSTRAINT fk_zc_goal_type_programme_version FOREIGN KEY (tenant_id, programme_version_id)
+    REFERENCES zc_programme_version (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_goal_type" constraintName="fk_zc_goal_type_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_goal_type" constraintName="fk_zc_goal_type_programme_version"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-20" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_programme_version"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_outcome_definition'::regclass AND conname IN ('fk_zc_outcome_definition_tenant', 'fk_zc_outcome_definition_programme_version')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_outcome_definition.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_outcome_definition
+  ADD CONSTRAINT fk_zc_outcome_definition_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_outcome_definition
+  ADD CONSTRAINT fk_zc_outcome_definition_programme_version FOREIGN KEY (tenant_id, programme_version_id)
+    REFERENCES zc_programme_version (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_outcome_definition" constraintName="fk_zc_outcome_definition_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_outcome_definition" constraintName="fk_zc_outcome_definition_programme_version"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 3. Triggers -->
+    <changeSet id="20260929-05-21" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_programme'::regclass AND tgname IN ('trg_zc_programme_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_programme.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_programme_touch BEFORE UPDATE ON zc_programme FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_programme_touch ON zc_programme;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-22" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_programme_version'::regclass AND tgname IN ('trg_zc_programme_version_immutable', 'trg_zc_programme_version_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_programme_version.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Published versions are immutable.
+CREATE TRIGGER trg_zc_programme_version_immutable
+  BEFORE UPDATE OR DELETE ON zc_programme_version
+  FOR EACH ROW EXECUTE FUNCTION zc_forbid_published_version_change('trg_zc_programme_version_immutable');
+CREATE TRIGGER trg_zc_programme_version_touch BEFORE UPDATE ON zc_programme_version FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_programme_version_immutable ON zc_programme_version;
+DROP TRIGGER trg_zc_programme_version_touch ON zc_programme_version;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-23" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_assessment_template'::regclass AND tgname IN ('trg_zc_assessment_template_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_assessment_template.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_assessment_template_touch BEFORE UPDATE ON zc_assessment_template FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_assessment_template_touch ON zc_assessment_template;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-24" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_assessment_template_version'::regclass AND tgname IN ('trg_zc_assessment_template_version_immutable', 'trg_zc_assessment_template_version_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_assessment_template_version.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Published questionnaires are immutable.
+CREATE TRIGGER trg_zc_assessment_template_version_immutable
+  BEFORE UPDATE OR DELETE ON zc_assessment_template_version
+  FOR EACH ROW EXECUTE FUNCTION zc_forbid_published_version_change('trg_zc_assessment_template_version_immutable');
+CREATE TRIGGER trg_zc_assessment_template_version_touch BEFORE UPDATE ON zc_assessment_template_version FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_assessment_template_version_immutable ON zc_assessment_template_version;
+DROP TRIGGER trg_zc_assessment_template_version_touch ON zc_assessment_template_version;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-25" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_gap_rule'::regclass AND tgname IN ('trg_zc_gap_rule_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_gap_rule.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_gap_rule_touch BEFORE UPDATE ON zc_gap_rule FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_gap_rule_touch ON zc_gap_rule;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-26" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_task_template'::regclass AND tgname IN ('trg_zc_task_template_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_task_template.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_task_template_touch BEFORE UPDATE ON zc_task_template FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_task_template_touch ON zc_task_template;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-27" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_referral_type'::regclass AND tgname IN ('trg_zc_referral_type_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_referral_type.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_referral_type_touch BEFORE UPDATE ON zc_referral_type FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_referral_type_touch ON zc_referral_type;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-28" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_observation_type'::regclass AND tgname IN ('trg_zc_observation_type_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_observation_type.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_observation_type_touch BEFORE UPDATE ON zc_observation_type FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_observation_type_touch ON zc_observation_type;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-29" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_goal_type'::regclass AND tgname IN ('trg_zc_goal_type_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_goal_type.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_goal_type_touch BEFORE UPDATE ON zc_goal_type FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_goal_type_touch ON zc_goal_type;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-05-30" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_outcome_definition'::regclass AND tgname IN ('trg_zc_outcome_definition_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_outcome_definition.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_outcome_definition_touch BEFORE UPDATE ON zc_outcome_definition FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_outcome_definition_touch ON zc_outcome_definition;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 4. Tenant isolation (row-level security) -->
+    <changeSet id="20260929-05-31" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_policy WHERE polname IN ('rls_zc_programme_tenant', 'rls_zc_programme_version_tenant', 'rls_zc_assessment_template_tenant', 'rls_zc_assessment_template_version_tenant', 'rls_zc_gap_rule_tenant', 'rls_zc_task_template_tenant', 'rls_zc_referral_type_tenant', 'rls_zc_observation_type_tenant', 'rls_zc_goal_type_tenant', 'rls_zc_outcome_definition_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Enable and force row-level security, with a tenant policy, on zc_programme, zc_programme_version, zc_assessment_template, zc_assessment_template_version, zc_gap_rule, zc_task_template, zc_referral_type, zc_observation_type, zc_goal_type, zc_outcome_definition.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Tenant isolation. The app must connect as zc_app: superusers bypass RLS.
+ALTER TABLE zc_programme ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_programme FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_programme_tenant ON zc_programme
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_programme_version ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_programme_version FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_programme_version_tenant ON zc_programme_version
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_assessment_template ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_assessment_template FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_assessment_template_tenant ON zc_assessment_template
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_assessment_template_version ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_assessment_template_version FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_assessment_template_version_tenant ON zc_assessment_template_version
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_gap_rule ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_gap_rule FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_gap_rule_tenant ON zc_gap_rule
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_task_template ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_task_template FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_task_template_tenant ON zc_task_template
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_referral_type ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_referral_type FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_referral_type_tenant ON zc_referral_type
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_observation_type ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_observation_type FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_observation_type_tenant ON zc_observation_type
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_goal_type ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_goal_type FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_goal_type_tenant ON zc_goal_type
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_outcome_definition ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_outcome_definition FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_outcome_definition_tenant ON zc_outcome_definition
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP POLICY rls_zc_programme_tenant ON zc_programme;
+ALTER TABLE zc_programme NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_programme DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_programme_version_tenant ON zc_programme_version;
+ALTER TABLE zc_programme_version NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_programme_version DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_assessment_template_tenant ON zc_assessment_template;
+ALTER TABLE zc_assessment_template NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_assessment_template DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_assessment_template_version_tenant ON zc_assessment_template_version;
+ALTER TABLE zc_assessment_template_version NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_assessment_template_version DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_gap_rule_tenant ON zc_gap_rule;
+ALTER TABLE zc_gap_rule NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_gap_rule DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_task_template_tenant ON zc_task_template;
+ALTER TABLE zc_task_template NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_task_template DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_referral_type_tenant ON zc_referral_type;
+ALTER TABLE zc_referral_type NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_referral_type DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_observation_type_tenant ON zc_observation_type;
+ALTER TABLE zc_observation_type NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_observation_type DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_goal_type_tenant ON zc_goal_type;
+ALTER TABLE zc_goal_type NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_goal_type DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_outcome_definition_tenant ON zc_outcome_definition;
+ALTER TABLE zc_outcome_definition NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_outcome_definition DISABLE ROW LEVEL SECURITY;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 5. Privileges for zc_app and zc_housekeeping -->
+    <changeSet id="20260929-05-32" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="2">SELECT count(*) FROM pg_roles WHERE rolname IN ('zc_app', 'zc_housekeeping')</sqlCheck>
+        </preConditions>
+        <comment>Grant the application privileges on the programme tables; append-only tables get no UPDATE, and no table gets DELETE.</comment>
+        <sql splitStatements="false"><![CDATA[
+GRANT SELECT, INSERT, UPDATE ON zc_programme TO zc_app;
+GRANT USAGE ON SEQUENCE zc_programme_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_programme_version TO zc_app;
+GRANT USAGE ON SEQUENCE zc_programme_version_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_assessment_template TO zc_app;
+GRANT USAGE ON SEQUENCE zc_assessment_template_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_assessment_template_version TO zc_app;
+GRANT USAGE ON SEQUENCE zc_assessment_template_version_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_gap_rule TO zc_app;
+GRANT USAGE ON SEQUENCE zc_gap_rule_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_task_template TO zc_app;
+GRANT USAGE ON SEQUENCE zc_task_template_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_referral_type TO zc_app;
+GRANT USAGE ON SEQUENCE zc_referral_type_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_observation_type TO zc_app;
+GRANT USAGE ON SEQUENCE zc_observation_type_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_goal_type TO zc_app;
+GRANT USAGE ON SEQUENCE zc_goal_type_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_outcome_definition TO zc_app;
+GRANT USAGE ON SEQUENCE zc_outcome_definition_id_seq TO zc_app;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+REVOKE ALL ON zc_programme FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_programme_id_seq FROM zc_app;
+REVOKE ALL ON zc_programme_version FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_programme_version_id_seq FROM zc_app;
+REVOKE ALL ON zc_assessment_template FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_assessment_template_id_seq FROM zc_app;
+REVOKE ALL ON zc_assessment_template_version FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_assessment_template_version_id_seq FROM zc_app;
+REVOKE ALL ON zc_gap_rule FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_gap_rule_id_seq FROM zc_app;
+REVOKE ALL ON zc_task_template FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_task_template_id_seq FROM zc_app;
+REVOKE ALL ON zc_referral_type FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_referral_type_id_seq FROM zc_app;
+REVOKE ALL ON zc_observation_type FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_observation_type_id_seq FROM zc_app;
+REVOKE ALL ON zc_goal_type FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_goal_type_id_seq FROM zc_app;
+REVOKE ALL ON zc_outcome_definition FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_outcome_definition_id_seq FROM zc_app;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+</databaseChangeLog>

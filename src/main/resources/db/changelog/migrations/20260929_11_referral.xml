@@ -1,0 +1,408 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- 20260929_11_referral.xml -->
+    <!-- Referrals, Transitions and Provider Participation: referral coordination records, care
+         transitions, provider participation and append-only provider actions. -->
+    <!-- Owned by the referral domain: com.zimasahealth.zcare.domains.referral (roadmap milestone M11). -->
+    <!-- Source: agreed design V001 section 09 and V002 grants. Author: adam16wilson7136 -->
+
+    <!-- 1. Tables, with their keys, checks, indexes and comments -->
+    <changeSet id="20260929-11-01" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_referral"/></not>
+        </preConditions>
+        <comment>Create table zc_referral.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_referral (
+  id                      bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id               bigint NOT NULL,
+  enrolment_id            bigint NOT NULL,
+  member_id               bigint NOT NULL,
+  referral_type_id        bigint NOT NULL,
+  receiving_org_id        bigint, -- NULL until receiver is known
+  receiving_provider_ref  text,
+  status                  text NOT NULL DEFAULT 'created',
+  reason                  text NOT NULL,
+  routed_at               timestamptz,
+  responded_at            timestamptz,
+  decline_reason          text,
+  completed_at            timestamptz,
+  confirmed_by            text,
+  confirmation_source     text,
+  evidence_ref            text,
+  cancel_reason           text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_referral_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_referral_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_referral PRIMARY KEY (id),
+  CONSTRAINT ck_zc_referral_status CHECK (status IN (
+    'created','routed','accepted','declined','in_progress','completed','cancelled','expired')),
+  CONSTRAINT ck_zc_referral_reason CHECK (btrim(reason) <> ''),
+  CONSTRAINT ck_zc_referral_confirmation_source CHECK (
+    confirmation_source IN ('provider','clinician','member_reported')),
+  -- Completion needs provider or clinician confirmation.
+  CONSTRAINT ck_zc_referral_completion CHECK (
+    status <> 'completed'
+    OR (nullif(btrim(confirmed_by), '') IS NOT NULL
+        AND confirmation_source IN ('provider','clinician')
+        AND completed_at IS NOT NULL)),
+  CONSTRAINT ck_zc_referral_routing CHECK (
+    status IN ('created','cancelled','expired')
+    OR receiving_org_id IS NOT NULL
+    OR nullif(btrim(receiving_provider_ref), '') IS NOT NULL),
+  CONSTRAINT ck_zc_referral_decline CHECK (status <> 'declined' OR nullif(btrim(decline_reason), '') IS NOT NULL),
+  CONSTRAINT ck_zc_referral_cancellation CHECK (status <> 'cancelled' OR nullif(btrim(cancel_reason), '') IS NOT NULL)
+);
+COMMENT ON TABLE zc_referral IS 'Coordination record, NOT a clinical order.';
+CREATE INDEX ix_zc_referral_enrolment ON zc_referral (tenant_id, enrolment_id, status);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_referral"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-11-02" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_transition"/></not>
+        </preConditions>
+        <comment>Create table zc_transition.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_transition (
+  id                bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id         bigint NOT NULL,
+  enrolment_id      bigint NOT NULL,
+  transition_type   text NOT NULL,
+  status            text NOT NULL DEFAULT 'notified',
+  occurred_at       timestamptz,
+  source_ref        text,
+  follow_up_due_at  timestamptz,
+  completed_at      timestamptz,
+  cancel_reason     text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_transition_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_transition_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_transition PRIMARY KEY (id),
+  CONSTRAINT ck_zc_transition_type CHECK (btrim(transition_type) <> ''),
+  CONSTRAINT ck_zc_transition_status CHECK (status IN ('notified','in_progress','completed','cancelled')),
+  CONSTRAINT ck_zc_transition_completed CHECK (status <> 'completed' OR completed_at IS NOT NULL),
+  CONSTRAINT ck_zc_transition_cancelled CHECK (status <> 'cancelled' OR nullif(btrim(cancel_reason), '') IS NOT NULL)
+);
+CREATE INDEX ix_zc_transition_enrolment ON zc_transition (tenant_id, enrolment_id, status);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_transition"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-11-03" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_provider_participation"/></not>
+        </preConditions>
+        <comment>Create table zc_provider_participation.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_provider_participation (
+  id                    bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id             bigint NOT NULL,
+  programme_version_id  bigint NOT NULL,
+  organisation_id       bigint NOT NULL,
+  status                text NOT NULL DEFAULT 'invited',
+  agreement_ref         text,
+  joined_at             timestamptz,
+  exited_at             timestamptz,
+  exit_reason           text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_provider_participation_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_provider_participation_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_provider_participation PRIMARY KEY (id),
+  CONSTRAINT uq_zc_provider_participation_fk_target UNIQUE (tenant_id, id),
+  CONSTRAINT ck_zc_provider_participation_status CHECK (status IN ('invited','active','suspended','withdrawn')),
+  CONSTRAINT ck_zc_provider_participation_joined CHECK (status <> 'active' OR joined_at IS NOT NULL),
+  CONSTRAINT ck_zc_provider_participation_exit CHECK (
+    status <> 'withdrawn' OR (exited_at IS NOT NULL AND nullif(btrim(exit_reason), '') IS NOT NULL))
+);
+CREATE UNIQUE INDEX uq_zc_provider_participation_live
+  ON zc_provider_participation (tenant_id, programme_version_id, organisation_id)
+  WHERE status IN ('invited','active','suspended');
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_provider_participation"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-11-04" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_provider_action"/></not>
+        </preConditions>
+        <comment>Create table zc_provider_action.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_provider_action (
+  id                bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id         bigint NOT NULL,
+  participation_id  bigint NOT NULL,
+  subject_type      text NOT NULL,
+  subject_id        bigint NOT NULL, -- polymorphic, no FK
+  action_code       text NOT NULL,
+  action_at         timestamptz NOT NULL DEFAULT now(),
+  actor_ref         text,
+  evidence_ref      text,
+  notes             text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_provider_action_created_by CHECK (btrim(created_by) <> ''),
+  CONSTRAINT pk_zc_provider_action PRIMARY KEY (id),
+  CONSTRAINT ck_zc_provider_action_subject_type CHECK (subject_type IN (
+    'referral','transition','care_plan','refill_request','task','enrolment','observation')),
+  CONSTRAINT ck_zc_provider_action_action_code CHECK (btrim(action_code) <> '')
+);
+COMMENT ON TABLE zc_provider_action IS
+  'Append-only evidence of provider actions; recordable only for a registered participant in that programme version.';
+CREATE INDEX ix_zc_provider_action_subject ON zc_provider_action (tenant_id, subject_type, subject_id);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_provider_action"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 2. Foreign keys, after every referenced table exists -->
+    <changeSet id="20260929-11-05" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_enrolment"/>
+            <tableExists schemaName="public" tableName="zc_member_reference"/>
+            <tableExists schemaName="public" tableName="zc_referral_type"/>
+            <tableExists schemaName="public" tableName="zc_organisation"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_referral'::regclass AND conname IN ('fk_zc_referral_tenant', 'fk_zc_referral_enrolment', 'fk_zc_referral_member', 'fk_zc_referral_referral_type', 'fk_zc_referral_receiving_org')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_referral.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_referral
+  ADD CONSTRAINT fk_zc_referral_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_referral
+  ADD CONSTRAINT fk_zc_referral_enrolment FOREIGN KEY (tenant_id, enrolment_id, member_id)
+    REFERENCES zc_enrolment (tenant_id, id, member_id);
+ALTER TABLE zc_referral
+  ADD CONSTRAINT fk_zc_referral_member FOREIGN KEY (tenant_id, member_id)
+    REFERENCES zc_member_reference (tenant_id, id);
+ALTER TABLE zc_referral
+  ADD CONSTRAINT fk_zc_referral_referral_type FOREIGN KEY (tenant_id, referral_type_id)
+    REFERENCES zc_referral_type (tenant_id, id);
+ALTER TABLE zc_referral
+  ADD CONSTRAINT fk_zc_referral_receiving_org FOREIGN KEY (tenant_id, receiving_org_id)
+    REFERENCES zc_organisation (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_referral" constraintName="fk_zc_referral_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_referral" constraintName="fk_zc_referral_enrolment"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_referral" constraintName="fk_zc_referral_member"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_referral" constraintName="fk_zc_referral_referral_type"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_referral" constraintName="fk_zc_referral_receiving_org"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-11-06" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_enrolment"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_transition'::regclass AND conname IN ('fk_zc_transition_tenant', 'fk_zc_transition_enrolment')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_transition.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_transition
+  ADD CONSTRAINT fk_zc_transition_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_transition
+  ADD CONSTRAINT fk_zc_transition_enrolment FOREIGN KEY (tenant_id, enrolment_id)
+    REFERENCES zc_enrolment (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_transition" constraintName="fk_zc_transition_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_transition" constraintName="fk_zc_transition_enrolment"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-11-07" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_programme_version"/>
+            <tableExists schemaName="public" tableName="zc_organisation"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_provider_participation'::regclass AND conname IN ('fk_zc_provider_participation_tenant', 'fk_zc_provider_participation_programme_version', 'fk_zc_provider_participation_organisation')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_provider_participation.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_provider_participation
+  ADD CONSTRAINT fk_zc_provider_participation_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_provider_participation
+  ADD CONSTRAINT fk_zc_provider_participation_programme_version FOREIGN KEY (tenant_id, programme_version_id)
+    REFERENCES zc_programme_version (tenant_id, id);
+ALTER TABLE zc_provider_participation
+  ADD CONSTRAINT fk_zc_provider_participation_organisation FOREIGN KEY (tenant_id, organisation_id)
+    REFERENCES zc_organisation (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_provider_participation" constraintName="fk_zc_provider_participation_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_provider_participation" constraintName="fk_zc_provider_participation_programme_version"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_provider_participation" constraintName="fk_zc_provider_participation_organisation"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-11-08" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_provider_participation"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_provider_action'::regclass AND conname IN ('fk_zc_provider_action_tenant', 'fk_zc_provider_action_participation')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_provider_action.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_provider_action
+  ADD CONSTRAINT fk_zc_provider_action_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_provider_action
+  ADD CONSTRAINT fk_zc_provider_action_participation FOREIGN KEY (tenant_id, participation_id)
+    REFERENCES zc_provider_participation (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_provider_action" constraintName="fk_zc_provider_action_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_provider_action" constraintName="fk_zc_provider_action_participation"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 3. Triggers -->
+    <changeSet id="20260929-11-09" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_referral'::regclass AND tgname IN ('trg_zc_referral_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_referral.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_referral_touch BEFORE UPDATE ON zc_referral FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_referral_touch ON zc_referral;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-11-10" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_transition'::regclass AND tgname IN ('trg_zc_transition_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_transition.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_transition_touch BEFORE UPDATE ON zc_transition FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_transition_touch ON zc_transition;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-11-11" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_provider_participation'::regclass AND tgname IN ('trg_zc_provider_participation_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_provider_participation.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_provider_participation_touch BEFORE UPDATE ON zc_provider_participation FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_provider_participation_touch ON zc_provider_participation;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-11-12" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_provider_action'::regclass AND tgname IN ('trg_zc_provider_action_append_only', 'trg_zc_provider_action_no_truncate')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_provider_action.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_provider_action_append_only BEFORE UPDATE OR DELETE ON zc_provider_action FOR EACH ROW EXECUTE FUNCTION zc_forbid_change('trg_zc_provider_action_append_only');
+CREATE TRIGGER trg_zc_provider_action_no_truncate BEFORE TRUNCATE ON zc_provider_action FOR EACH STATEMENT EXECUTE FUNCTION zc_forbid_change('trg_zc_provider_action_append_only');
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_provider_action_append_only ON zc_provider_action;
+DROP TRIGGER trg_zc_provider_action_no_truncate ON zc_provider_action;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 4. Tenant isolation (row-level security) -->
+    <changeSet id="20260929-11-13" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_policy WHERE polname IN ('rls_zc_referral_tenant', 'rls_zc_transition_tenant', 'rls_zc_provider_participation_tenant', 'rls_zc_provider_action_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Enable and force row-level security, with a tenant policy, on zc_referral, zc_transition, zc_provider_participation, zc_provider_action.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Tenant isolation. The app must connect as zc_app: superusers bypass RLS.
+ALTER TABLE zc_referral ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_referral FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_referral_tenant ON zc_referral
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_transition ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_transition FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_transition_tenant ON zc_transition
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_provider_participation ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_provider_participation FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_provider_participation_tenant ON zc_provider_participation
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_provider_action ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_provider_action FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_provider_action_tenant ON zc_provider_action
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP POLICY rls_zc_referral_tenant ON zc_referral;
+ALTER TABLE zc_referral NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_referral DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_transition_tenant ON zc_transition;
+ALTER TABLE zc_transition NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_transition DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_provider_participation_tenant ON zc_provider_participation;
+ALTER TABLE zc_provider_participation NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_provider_participation DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_provider_action_tenant ON zc_provider_action;
+ALTER TABLE zc_provider_action NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_provider_action DISABLE ROW LEVEL SECURITY;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 5. Privileges for zc_app and zc_housekeeping -->
+    <changeSet id="20260929-11-14" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="2">SELECT count(*) FROM pg_roles WHERE rolname IN ('zc_app', 'zc_housekeeping')</sqlCheck>
+        </preConditions>
+        <comment>Grant the application privileges on the referral tables; append-only tables get no UPDATE, and no table gets DELETE.</comment>
+        <sql splitStatements="false"><![CDATA[
+GRANT SELECT, INSERT, UPDATE ON zc_referral TO zc_app;
+GRANT USAGE ON SEQUENCE zc_referral_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_transition TO zc_app;
+GRANT USAGE ON SEQUENCE zc_transition_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_provider_participation TO zc_app;
+GRANT USAGE ON SEQUENCE zc_provider_participation_id_seq TO zc_app;
+GRANT SELECT, INSERT ON zc_provider_action TO zc_app;
+REVOKE UPDATE, DELETE, TRUNCATE ON zc_provider_action FROM zc_app;
+GRANT USAGE ON SEQUENCE zc_provider_action_id_seq TO zc_app;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+REVOKE ALL ON zc_referral FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_referral_id_seq FROM zc_app;
+REVOKE ALL ON zc_transition FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_transition_id_seq FROM zc_app;
+REVOKE ALL ON zc_provider_participation FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_provider_participation_id_seq FROM zc_app;
+REVOKE ALL ON zc_provider_action FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_provider_action_id_seq FROM zc_app;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+</databaseChangeLog>

@@ -1,0 +1,555 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- 20260929_03_access.xml -->
+    <!-- Tenant and Access: the tenant registry, organisations, role grants, break-glass grants,
+         configuration history, local user accounts and per-tenant WhatsApp numbers. -->
+    <!-- Owned by the access domain: com.zimasahealth.zcare.domains.access (roadmap milestone M3). -->
+    <!-- Source: agreed design V001 section 01, V002 grants, V004 and V005. Author: adam16wilson7136 -->
+
+    <!-- 1. Tables, with their keys, checks, indexes and comments -->
+    <changeSet id="20260929-03-01" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_tenant"/></not>
+        </preConditions>
+        <comment>Create table zc_tenant.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_tenant (
+  id          bigint GENERATED ALWAYS AS IDENTITY,
+  code        text NOT NULL,
+  name        text NOT NULL,
+  status      text NOT NULL DEFAULT 'active',
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_tenant_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_tenant_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_tenant PRIMARY KEY (id),
+  CONSTRAINT uq_zc_tenant_code UNIQUE (code),
+  CONSTRAINT ck_zc_tenant_code   CHECK (btrim(code) <> ''),
+  CONSTRAINT ck_zc_tenant_name   CHECK (btrim(name) <> ''),
+  CONSTRAINT ck_zc_tenant_status CHECK (status IN ('active','suspended','closed'))
+);
+COMMENT ON TABLE zc_tenant IS
+  'Tenant registry. The only table without tenant_id and without RLS: zc_app must read it to resolve X-Tenant-Id (04D 12.3). Holds no health or member data.';
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_tenant"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-03-02" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_organisation"/></not>
+        </preConditions>
+        <comment>Create table zc_organisation.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_organisation (
+  id          bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id   bigint NOT NULL,
+  code        text NOT NULL,
+  name        text NOT NULL,
+  org_type    text NOT NULL,
+  status      text NOT NULL DEFAULT 'active',
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_organisation_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_organisation_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_organisation PRIMARY KEY (id),
+  CONSTRAINT uq_zc_organisation_fk_target UNIQUE (tenant_id, id),
+  CONSTRAINT uq_zc_organisation_code UNIQUE (tenant_id, code),
+  CONSTRAINT ck_zc_organisation_code     CHECK (btrim(code) <> ''),
+  CONSTRAINT ck_zc_organisation_name     CHECK (btrim(name) <> ''),
+  CONSTRAINT ck_zc_organisation_org_type CHECK (btrim(org_type) <> ''),
+  CONSTRAINT ck_zc_organisation_status   CHECK (status IN ('active','suspended','inactive'))
+);
+COMMENT ON TABLE zc_organisation IS 'Every org is scoped to exactly one tenant -- no cross-tenant orgs.';
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_organisation"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-03-03" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_role_assignment"/></not>
+        </preConditions>
+        <comment>Create table zc_role_assignment.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_role_assignment (
+  id               bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id        bigint NOT NULL,
+  organisation_id  bigint NOT NULL,
+  actor_id         text NOT NULL,
+  role_code        text NOT NULL,
+  valid_from       timestamptz NOT NULL DEFAULT now(),
+  valid_to         timestamptz,
+  granted_by       text NOT NULL,
+  revoked_at       timestamptz,
+  revoked_by       text,
+  revoke_reason    text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_role_assignment_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_role_assignment_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_role_assignment PRIMARY KEY (id),
+  CONSTRAINT ck_zc_role_assignment_actor      CHECK (btrim(actor_id) <> ''),
+  CONSTRAINT ck_zc_role_assignment_role_code  CHECK (btrim(role_code) <> ''),
+  CONSTRAINT ck_zc_role_assignment_granted_by CHECK (btrim(granted_by) <> ''),
+  CONSTRAINT ck_zc_role_assignment_validity   CHECK (valid_to IS NULL OR valid_to > valid_from),
+  CONSTRAINT ck_zc_role_assignment_revocation CHECK (
+    (revoked_at IS NULL AND revoked_by IS NULL AND revoke_reason IS NULL)
+    OR (revoked_at IS NOT NULL
+        AND nullif(btrim(revoked_by), '') IS NOT NULL
+        AND nullif(btrim(revoke_reason), '') IS NOT NULL)),
+  -- No overlapping grants of the same role.
+  CONSTRAINT uq_zc_role_assignment_no_overlap EXCLUDE USING gist (
+    tenant_id       WITH =,
+    organisation_id WITH =,
+    actor_id        WITH =,
+    role_code       WITH =,
+    (tstzrange(valid_from, valid_to)) WITH &&
+  ) WHERE (revoked_at IS NULL)
+);
+COMMENT ON TABLE zc_role_assignment IS 'A role is always granted within an org, never floating free of one.';
+CREATE INDEX ix_zc_role_assignment_actor ON zc_role_assignment (tenant_id, actor_id);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_role_assignment"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-03-04" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_break_glass_grant"/></not>
+        </preConditions>
+        <comment>Create table zc_break_glass_grant.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_break_glass_grant (
+  id           bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id    bigint NOT NULL,
+  actor_id     text NOT NULL,
+  reason       text NOT NULL,
+  granted_at   timestamptz NOT NULL DEFAULT now(),
+  expires_at   timestamptz NOT NULL,
+  revoked_at   timestamptz,
+  revoked_by   text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_break_glass_grant_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_break_glass_grant_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_break_glass_grant PRIMARY KEY (id),
+  CONSTRAINT ck_zc_break_glass_grant_actor      CHECK (btrim(actor_id) <> ''),
+  CONSTRAINT ck_zc_break_glass_grant_reason     CHECK (btrim(reason) <> ''),
+  CONSTRAINT ck_zc_break_glass_grant_time_bound CHECK (expires_at > granted_at),
+  CONSTRAINT ck_zc_break_glass_grant_revocation CHECK (
+    (revoked_at IS NULL AND revoked_by IS NULL)
+    OR (revoked_at IS NOT NULL AND nullif(btrim(revoked_by), '') IS NOT NULL))
+);
+COMMENT ON TABLE zc_break_glass_grant IS 'Time-bound elevated access. Use of a grant is also written to zc_security_event.';
+CREATE INDEX ix_zc_break_glass_grant_actor ON zc_break_glass_grant (tenant_id, actor_id, expires_at);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_break_glass_grant"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-03-05" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_config_history"/></not>
+        </preConditions>
+        <comment>Create table zc_config_history.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Append-only. A config change is a new row.
+CREATE TABLE zc_config_history (
+  id              bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id       bigint NOT NULL,
+  config_scope    text NOT NULL,
+  config_key      text NOT NULL,
+  config_value    text NOT NULL,
+  effective_from  timestamptz NOT NULL,
+  change_reason   text NOT NULL,
+  approved_by     text,
+  approved_at     timestamptz,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_config_history_created_by CHECK (btrim(created_by) <> ''),
+  CONSTRAINT pk_zc_config_history PRIMARY KEY (id),
+  CONSTRAINT uq_zc_config_history_effective UNIQUE (tenant_id, config_scope, config_key, effective_from),
+  CONSTRAINT ck_zc_config_history_scope  CHECK (btrim(config_scope) <> ''),
+  CONSTRAINT ck_zc_config_history_key    CHECK (btrim(config_key) <> ''),
+  CONSTRAINT ck_zc_config_history_reason CHECK (btrim(change_reason) <> ''),
+  CONSTRAINT ck_zc_config_history_approval_pair CHECK ((approved_by IS NULL) = (approved_at IS NULL))
+);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_config_history"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-03-06" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_user"/></not>
+        </preConditions>
+        <comment>Create table zc_user.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Local login credentials: a placeholder until Keycloak owns sign-in (ADR-0004).
+-- No RLS: login happens before the tenant is known.
+CREATE TABLE zc_user (
+  id                   bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id            bigint NOT NULL,
+  org                  bigint, -- NULL for platform_admin
+  email                text NOT NULL,
+  password_hash        text NOT NULL,
+  role                 text NOT NULL,
+  status               text NOT NULL DEFAULT 'active',
+  display_name         text,
+  failed_login_count   integer NOT NULL DEFAULT 0,
+  locked_until         timestamptz,
+  last_login_at        timestamptz,
+  password_changed_at  timestamptz NOT NULL DEFAULT now(),
+  created_at           timestamptz NOT NULL DEFAULT now(),
+  created_by           text NOT NULL CONSTRAINT ck_zc_user_created_by CHECK (btrim(created_by) <> ''),
+  updated_at           timestamptz NOT NULL DEFAULT now(),
+  updated_by           text,
+  row_version          integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_user_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_user PRIMARY KEY (id),
+  CONSTRAINT ck_zc_user_email CHECK (email ~ '^[^@[:space:]]+@[^@[:space:]]+$'),
+  CONSTRAINT ck_zc_user_role CHECK (btrim(role) <> ''),
+  CONSTRAINT ck_zc_user_org_required CHECK (role = 'platform_admin' OR org IS NOT NULL),
+  CONSTRAINT ck_zc_user_status CHECK (status IN ('active','disabled','locked')),
+  -- Rejects obvious plaintext.
+  CONSTRAINT ck_zc_user_password_hash CHECK (length(password_hash) >= 50),
+  CONSTRAINT ck_zc_user_failed_logins CHECK (failed_login_count >= 0)
+);
+COMMENT ON TABLE zc_user IS 'Local login credentials. RLS-exempt by design (04D-style exemption, see zc_security_event).';
+-- Email unique across all tenants, case-insensitive.
+CREATE UNIQUE INDEX uq_zc_user_email ON zc_user (lower(email));
+CREATE INDEX ix_zc_user_tenant ON zc_user (tenant_id);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_user"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-03-07" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_tenant_whatsapp"/></not>
+        </preConditions>
+        <comment>Create table zc_tenant_whatsapp.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- No RLS: the webhook resolves the tenant from phone_number_id before any tenant context exists.
+-- Security: access_token conflicts with 04D section 14 (no secrets in the database); kept as the agreed baseline (ADR-0004).
+CREATE TABLE zc_tenant_whatsapp (
+  tenant_id        bigint NOT NULL,
+  phone_number_id  text NOT NULL,
+  access_token     text NOT NULL,
+  active           boolean NOT NULL DEFAULT true,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  created_by       text NOT NULL CONSTRAINT ck_zc_tenant_whatsapp_created_by CHECK (btrim(created_by) <> ''),
+  updated_at       timestamptz NOT NULL DEFAULT now(),
+  updated_by       text,
+  row_version      integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_tenant_whatsapp_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_tenant_whatsapp PRIMARY KEY (tenant_id),
+  -- One tenant per number.
+  CONSTRAINT uq_zc_tenant_whatsapp_phone_number UNIQUE (phone_number_id),
+  CONSTRAINT ck_zc_tenant_whatsapp_phone_number CHECK (btrim(phone_number_id) <> ''),
+  CONSTRAINT ck_zc_tenant_whatsapp_access_token CHECK (btrim(access_token) <> '')
+);
+COMMENT ON COLUMN zc_tenant_whatsapp.access_token IS
+  'SECURITY: conflicts with 04D 14 (secrets never in the database). Should hold a secret-store reference, not the token.';
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_tenant_whatsapp"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 2. Foreign keys, after every referenced table exists -->
+    <changeSet id="20260929-03-08" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_organisation'::regclass AND conname IN ('fk_zc_organisation_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_organisation.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_organisation
+  ADD CONSTRAINT fk_zc_organisation_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_organisation" constraintName="fk_zc_organisation_tenant"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-03-09" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_organisation"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_role_assignment'::regclass AND conname IN ('fk_zc_role_assignment_tenant', 'fk_zc_role_assignment_organisation')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_role_assignment.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_role_assignment
+  ADD CONSTRAINT fk_zc_role_assignment_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_role_assignment
+  ADD CONSTRAINT fk_zc_role_assignment_organisation FOREIGN KEY (tenant_id, organisation_id)
+    REFERENCES zc_organisation (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_role_assignment" constraintName="fk_zc_role_assignment_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_role_assignment" constraintName="fk_zc_role_assignment_organisation"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-03-10" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_break_glass_grant'::regclass AND conname IN ('fk_zc_break_glass_grant_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_break_glass_grant.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_break_glass_grant
+  ADD CONSTRAINT fk_zc_break_glass_grant_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_break_glass_grant" constraintName="fk_zc_break_glass_grant_tenant"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-03-11" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_config_history'::regclass AND conname IN ('fk_zc_config_history_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_config_history.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_config_history
+  ADD CONSTRAINT fk_zc_config_history_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_config_history" constraintName="fk_zc_config_history_tenant"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-03-12" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_organisation"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_user'::regclass AND conname IN ('fk_zc_user_tenant', 'fk_zc_user_org')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_user.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_user
+  ADD CONSTRAINT fk_zc_user_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+-- Org must be in the same tenant.
+ALTER TABLE zc_user
+  ADD CONSTRAINT fk_zc_user_org FOREIGN KEY (tenant_id, org) REFERENCES zc_organisation (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_user" constraintName="fk_zc_user_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_user" constraintName="fk_zc_user_org"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-03-13" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_tenant_whatsapp'::regclass AND conname IN ('fk_zc_tenant_whatsapp_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_tenant_whatsapp.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_tenant_whatsapp
+  ADD CONSTRAINT fk_zc_tenant_whatsapp_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_tenant_whatsapp" constraintName="fk_zc_tenant_whatsapp_tenant"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 3. Triggers -->
+    <changeSet id="20260929-03-14" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_tenant'::regclass AND tgname IN ('trg_zc_tenant_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_tenant.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_tenant_touch BEFORE UPDATE ON zc_tenant FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_tenant_touch ON zc_tenant;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-03-15" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_organisation'::regclass AND tgname IN ('trg_zc_organisation_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_organisation.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_organisation_touch BEFORE UPDATE ON zc_organisation FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_organisation_touch ON zc_organisation;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-03-16" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_role_assignment'::regclass AND tgname IN ('trg_zc_role_assignment_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_role_assignment.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_role_assignment_touch BEFORE UPDATE ON zc_role_assignment FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_role_assignment_touch ON zc_role_assignment;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-03-17" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_break_glass_grant'::regclass AND tgname IN ('trg_zc_break_glass_grant_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_break_glass_grant.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_break_glass_grant_touch BEFORE UPDATE ON zc_break_glass_grant FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_break_glass_grant_touch ON zc_break_glass_grant;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-03-18" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_config_history'::regclass AND tgname IN ('trg_zc_config_history_append_only', 'trg_zc_config_history_no_truncate')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_config_history.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_config_history_append_only BEFORE UPDATE OR DELETE ON zc_config_history FOR EACH ROW EXECUTE FUNCTION zc_forbid_change('trg_zc_config_history_append_only');
+CREATE TRIGGER trg_zc_config_history_no_truncate BEFORE TRUNCATE ON zc_config_history FOR EACH STATEMENT EXECUTE FUNCTION zc_forbid_change('trg_zc_config_history_append_only');
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_config_history_append_only ON zc_config_history;
+DROP TRIGGER trg_zc_config_history_no_truncate ON zc_config_history;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-03-19" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_user'::regclass AND tgname IN ('trg_zc_user_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_user.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_user_touch BEFORE UPDATE ON zc_user
+  FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_user_touch ON zc_user;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-03-20" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_tenant_whatsapp'::regclass AND tgname IN ('trg_zc_tenant_whatsapp_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_tenant_whatsapp.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_tenant_whatsapp_touch BEFORE UPDATE ON zc_tenant_whatsapp
+  FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_tenant_whatsapp_touch ON zc_tenant_whatsapp;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 4. Tenant isolation (row-level security) -->
+    <changeSet id="20260929-03-21" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_policy WHERE polname IN ('rls_zc_organisation_tenant', 'rls_zc_role_assignment_tenant', 'rls_zc_break_glass_grant_tenant', 'rls_zc_config_history_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Enable and force row-level security, with a tenant policy, on zc_organisation, zc_role_assignment, zc_break_glass_grant, zc_config_history.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Tenant isolation. The app must connect as zc_app: superusers bypass RLS.
+ALTER TABLE zc_organisation ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_organisation FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_organisation_tenant ON zc_organisation
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_role_assignment ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_role_assignment FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_role_assignment_tenant ON zc_role_assignment
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_break_glass_grant ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_break_glass_grant FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_break_glass_grant_tenant ON zc_break_glass_grant
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_config_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_config_history FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_config_history_tenant ON zc_config_history
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP POLICY rls_zc_organisation_tenant ON zc_organisation;
+ALTER TABLE zc_organisation NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_organisation DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_role_assignment_tenant ON zc_role_assignment;
+ALTER TABLE zc_role_assignment NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_role_assignment DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_break_glass_grant_tenant ON zc_break_glass_grant;
+ALTER TABLE zc_break_glass_grant NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_break_glass_grant DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_config_history_tenant ON zc_config_history;
+ALTER TABLE zc_config_history NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_config_history DISABLE ROW LEVEL SECURITY;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 5. Privileges for zc_app and zc_housekeeping -->
+    <changeSet id="20260929-03-22" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="2">SELECT count(*) FROM pg_roles WHERE rolname IN ('zc_app', 'zc_housekeeping')</sqlCheck>
+        </preConditions>
+        <comment>Grant the application privileges on the access tables; append-only tables get no UPDATE, and no table gets DELETE.</comment>
+        <sql splitStatements="false"><![CDATA[
+GRANT SELECT ON zc_tenant TO zc_app;
+GRANT SELECT ON zc_tenant TO zc_housekeeping;
+GRANT USAGE ON SEQUENCE zc_tenant_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_organisation TO zc_app;
+GRANT USAGE ON SEQUENCE zc_organisation_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_role_assignment TO zc_app;
+GRANT USAGE ON SEQUENCE zc_role_assignment_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_break_glass_grant TO zc_app;
+GRANT USAGE ON SEQUENCE zc_break_glass_grant_id_seq TO zc_app;
+GRANT SELECT, INSERT ON zc_config_history TO zc_app;
+REVOKE UPDATE, DELETE, TRUNCATE ON zc_config_history FROM zc_app;
+GRANT USAGE ON SEQUENCE zc_config_history_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_user TO zc_app;
+GRANT USAGE ON SEQUENCE zc_user_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_tenant_whatsapp TO zc_app;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+REVOKE ALL ON zc_tenant FROM zc_app, zc_housekeeping;
+REVOKE USAGE ON SEQUENCE zc_tenant_id_seq FROM zc_app;
+REVOKE ALL ON zc_organisation FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_organisation_id_seq FROM zc_app;
+REVOKE ALL ON zc_role_assignment FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_role_assignment_id_seq FROM zc_app;
+REVOKE ALL ON zc_break_glass_grant FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_break_glass_grant_id_seq FROM zc_app;
+REVOKE ALL ON zc_config_history FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_config_history_id_seq FROM zc_app;
+REVOKE ALL ON zc_user FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_user_id_seq FROM zc_app;
+REVOKE ALL ON zc_tenant_whatsapp FROM zc_app;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+</databaseChangeLog>

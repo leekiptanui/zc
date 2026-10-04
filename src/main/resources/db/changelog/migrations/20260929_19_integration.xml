@@ -1,0 +1,387 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- 20260929_19_integration.xml -->
+    <!-- Integration Persistence: idempotency keys, the transactional outbox and inbox, and dead
+         letters. -->
+    <!-- Owned by the integration domain: com.zimasahealth.zcare.domains.integration (roadmap milestone M18). -->
+    <!-- Source: agreed design V001 section 17 and V002 grants. Author: adam16wilson7136 -->
+
+    <!-- 1. Tables, with their keys, checks, indexes and comments -->
+    <changeSet id="20260929-19-01" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_idempotency_key"/></not>
+        </preConditions>
+        <comment>Create table zc_idempotency_key.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_idempotency_key (
+  id                 bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id          bigint NOT NULL,
+  idempotency_key    text NOT NULL,
+  actor_id           text NOT NULL,
+  route              text NOT NULL,
+  request_body_hash  text NOT NULL,
+  status             text NOT NULL DEFAULT 'in_progress',
+  response_status    integer,
+  response_envelope  jsonb,
+  expires_at         timestamptz NOT NULL DEFAULT (now() + interval '24 hours'),
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_idempotency_key_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_idempotency_key_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_idempotency_key PRIMARY KEY (id),
+  CONSTRAINT uq_zc_idempotency_key UNIQUE (tenant_id, idempotency_key, actor_id, route),
+  CONSTRAINT ck_zc_idempotency_key_key   CHECK (btrim(idempotency_key) <> ''),
+  CONSTRAINT ck_zc_idempotency_key_actor CHECK (btrim(actor_id) <> ''),
+  CONSTRAINT ck_zc_idempotency_key_route CHECK (btrim(route) <> ''),
+  CONSTRAINT ck_zc_idempotency_key_hash  CHECK (btrim(request_body_hash) <> ''),
+  CONSTRAINT ck_zc_idempotency_key_status CHECK (status IN ('in_progress','completed')),
+  CONSTRAINT ck_zc_idempotency_key_response CHECK (
+    status <> 'completed' OR (response_envelope IS NOT NULL AND response_status IS NOT NULL)),
+  CONSTRAINT ck_zc_idempotency_key_retention CHECK (expires_at >= created_at + interval '24 hours')
+);
+COMMENT ON COLUMN zc_idempotency_key.response_envelope IS
+  'jsonb: cached API response envelope, replayed byte-identical.';
+CREATE INDEX ix_zc_idempotency_key_expiry ON zc_idempotency_key (tenant_id, expires_at);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_idempotency_key"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-19-02" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_integration_outbox"/></not>
+        </preConditions>
+        <comment>Create table zc_integration_outbox.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_integration_outbox (
+  id                   bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id            bigint NOT NULL,
+  event_type           text NOT NULL,
+  aggregate_type       text NOT NULL,
+  aggregate_id         bigint NOT NULL,
+  correlation_id       text NOT NULL,
+  occurred_at          timestamptz NOT NULL DEFAULT now(),
+  payload              jsonb NOT NULL,
+  data_classification  text NOT NULL,
+  status               text NOT NULL DEFAULT 'pending',
+  attempt_count        integer NOT NULL DEFAULT 0,
+  next_attempt_at      timestamptz NOT NULL DEFAULT now(),
+  published_at         timestamptz,
+  last_error           text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_integration_outbox_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_integration_outbox_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_integration_outbox PRIMARY KEY (id),
+  CONSTRAINT ck_zc_integration_outbox_event_type CHECK (btrim(event_type) <> ''),
+  CONSTRAINT ck_zc_integration_outbox_aggregate_type CHECK (btrim(aggregate_type) <> ''),
+  CONSTRAINT ck_zc_integration_outbox_correlation CHECK (btrim(correlation_id) <> ''),
+  CONSTRAINT ck_zc_integration_outbox_classification CHECK (data_classification IN ('phi','non_phi')),
+  CONSTRAINT ck_zc_integration_outbox_status CHECK (status IN ('pending','published','failed','dead_lettered')),
+  CONSTRAINT ck_zc_integration_outbox_attempts CHECK (attempt_count >= 0),
+  CONSTRAINT ck_zc_integration_outbox_published CHECK (status <> 'published' OR published_at IS NOT NULL)
+);
+COMMENT ON TABLE zc_integration_outbox IS
+  'Transactional outbox: written in the SAME transaction as the aggregate change that produced the event.';
+COMMENT ON COLUMN zc_integration_outbox.payload IS 'jsonb: 04B 12 event envelope payload.';
+CREATE INDEX ix_zc_outbox_pending
+  ON zc_integration_outbox (tenant_id, next_attempt_at, occurred_at)
+  WHERE status IN ('pending','failed');
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_integration_outbox"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-19-03" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_integration_inbox"/></not>
+        </preConditions>
+        <comment>Create table zc_integration_inbox.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_integration_inbox (
+  id                   bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id            bigint NOT NULL,
+  source_system        text NOT NULL,   -- free text from adapter
+  external_message_id  text NOT NULL,   -- e.g. wamid
+  received_at          timestamptz NOT NULL DEFAULT now(),
+  payload              jsonb NOT NULL,
+  data_classification  text NOT NULL,
+  status               text NOT NULL DEFAULT 'received',
+  attempt_count        integer NOT NULL DEFAULT 0,
+  next_attempt_at      timestamptz NOT NULL DEFAULT now(),
+  processed_at         timestamptz,
+  last_error           text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_integration_inbox_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_integration_inbox_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_integration_inbox PRIMARY KEY (id),
+  CONSTRAINT uq_zc_integration_inbox_dedup UNIQUE (tenant_id, source_system, external_message_id),
+  CONSTRAINT ck_zc_integration_inbox_source_system CHECK (btrim(source_system) <> ''),
+  CONSTRAINT ck_zc_integration_inbox_message_id CHECK (btrim(external_message_id) <> ''),
+  CONSTRAINT ck_zc_integration_inbox_classification CHECK (data_classification IN ('phi','non_phi')),
+  CONSTRAINT ck_zc_integration_inbox_status CHECK (status IN ('received','processing','processed','failed','dead_lettered')),
+  CONSTRAINT ck_zc_integration_inbox_attempts CHECK (attempt_count >= 0),
+  CONSTRAINT ck_zc_integration_inbox_processed CHECK (status <> 'processed' OR processed_at IS NOT NULL)
+);
+COMMENT ON COLUMN zc_integration_inbox.payload IS 'jsonb: raw inbound envelope as received.';
+CREATE INDEX ix_zc_integration_inbox_pending
+  ON zc_integration_inbox (tenant_id, next_attempt_at)
+  WHERE status IN ('received','failed');
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_integration_inbox"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-19-04" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_dead_letter"/></not>
+        </preConditions>
+        <comment>Create table zc_dead_letter.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_dead_letter (
+  id                      bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id               bigint NOT NULL,
+  origin                  text NOT NULL,
+  origin_id               bigint NOT NULL, -- polymorphic, no FK
+  failure_reason          text NOT NULL,
+  payload                 jsonb,
+  attempt_count           integer NOT NULL DEFAULT 0,
+  parked_at               timestamptz NOT NULL DEFAULT now(),
+  status                  text NOT NULL DEFAULT 'parked',
+  operational_task_id     bigint, -- follow-up task
+  reconciliation_outcome  text,
+  resolved_by             text,
+  resolved_at             timestamptz,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_dead_letter_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_dead_letter_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_dead_letter PRIMARY KEY (id),
+  CONSTRAINT ck_zc_dead_letter_origin CHECK (origin IN (
+    'integration_outbox','integration_inbox','outreach_delivery','inbound_message')),
+  CONSTRAINT ck_zc_dead_letter_failure_reason CHECK (btrim(failure_reason) <> ''),
+  CONSTRAINT ck_zc_dead_letter_attempts CHECK (attempt_count >= 0),
+  CONSTRAINT ck_zc_dead_letter_status CHECK (status IN ('parked','reconciling','resolved','discarded')),
+  CONSTRAINT ck_zc_dead_letter_resolution CHECK (
+    status NOT IN ('resolved','discarded')
+    OR (nullif(btrim(reconciliation_outcome), '') IS NOT NULL
+        AND nullif(btrim(resolved_by), '') IS NOT NULL
+        AND resolved_at IS NOT NULL))
+);
+COMMENT ON COLUMN zc_dead_letter.payload IS 'jsonb: copy of the failed message envelope, kept for reconciliation.';
+CREATE INDEX ix_zc_dead_letter_open ON zc_dead_letter (tenant_id, parked_at) WHERE status IN ('parked','reconciling');
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_dead_letter"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 2. Foreign keys, after every referenced table exists -->
+    <changeSet id="20260929-19-05" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_idempotency_key'::regclass AND conname IN ('fk_zc_idempotency_key_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_idempotency_key.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_idempotency_key
+  ADD CONSTRAINT fk_zc_idempotency_key_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_idempotency_key" constraintName="fk_zc_idempotency_key_tenant"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-19-06" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_integration_outbox'::regclass AND conname IN ('fk_zc_integration_outbox_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_integration_outbox.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_integration_outbox
+  ADD CONSTRAINT fk_zc_integration_outbox_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_integration_outbox" constraintName="fk_zc_integration_outbox_tenant"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-19-07" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_integration_inbox'::regclass AND conname IN ('fk_zc_integration_inbox_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_integration_inbox.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_integration_inbox
+  ADD CONSTRAINT fk_zc_integration_inbox_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_integration_inbox" constraintName="fk_zc_integration_inbox_tenant"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-19-08" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_task"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_dead_letter'::regclass AND conname IN ('fk_zc_dead_letter_tenant', 'fk_zc_dead_letter_operational_task')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_dead_letter.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_dead_letter
+  ADD CONSTRAINT fk_zc_dead_letter_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_dead_letter
+  ADD CONSTRAINT fk_zc_dead_letter_operational_task FOREIGN KEY (tenant_id, operational_task_id)
+    REFERENCES zc_task (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_dead_letter" constraintName="fk_zc_dead_letter_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_dead_letter" constraintName="fk_zc_dead_letter_operational_task"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 3. Triggers -->
+    <changeSet id="20260929-19-09" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_idempotency_key'::regclass AND tgname IN ('trg_zc_idempotency_key_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_idempotency_key.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_idempotency_key_touch BEFORE UPDATE ON zc_idempotency_key FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_idempotency_key_touch ON zc_idempotency_key;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-19-10" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_integration_outbox'::regclass AND tgname IN ('trg_zc_integration_outbox_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_integration_outbox.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_integration_outbox_touch BEFORE UPDATE ON zc_integration_outbox FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_integration_outbox_touch ON zc_integration_outbox;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-19-11" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_integration_inbox'::regclass AND tgname IN ('trg_zc_integration_inbox_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_integration_inbox.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_integration_inbox_touch BEFORE UPDATE ON zc_integration_inbox FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_integration_inbox_touch ON zc_integration_inbox;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-19-12" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_dead_letter'::regclass AND tgname IN ('trg_zc_dead_letter_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_dead_letter.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_dead_letter_touch BEFORE UPDATE ON zc_dead_letter FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_dead_letter_touch ON zc_dead_letter;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 4. Tenant isolation (row-level security) -->
+    <changeSet id="20260929-19-13" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_policy WHERE polname IN ('rls_zc_idempotency_key_tenant', 'rls_zc_integration_outbox_tenant', 'rls_zc_integration_inbox_tenant', 'rls_zc_dead_letter_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Enable and force row-level security, with a tenant policy, on zc_idempotency_key, zc_integration_outbox, zc_integration_inbox, zc_dead_letter.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Tenant isolation. The app must connect as zc_app: superusers bypass RLS.
+ALTER TABLE zc_idempotency_key ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_idempotency_key FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_idempotency_key_tenant ON zc_idempotency_key
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_integration_outbox ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_integration_outbox FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_integration_outbox_tenant ON zc_integration_outbox
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_integration_inbox ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_integration_inbox FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_integration_inbox_tenant ON zc_integration_inbox
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_dead_letter ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_dead_letter FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_dead_letter_tenant ON zc_dead_letter
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP POLICY rls_zc_idempotency_key_tenant ON zc_idempotency_key;
+ALTER TABLE zc_idempotency_key NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_idempotency_key DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_integration_outbox_tenant ON zc_integration_outbox;
+ALTER TABLE zc_integration_outbox NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_integration_outbox DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_integration_inbox_tenant ON zc_integration_inbox;
+ALTER TABLE zc_integration_inbox NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_integration_inbox DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_dead_letter_tenant ON zc_dead_letter;
+ALTER TABLE zc_dead_letter NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_dead_letter DISABLE ROW LEVEL SECURITY;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 5. Privileges for zc_app and zc_housekeeping -->
+    <changeSet id="20260929-19-14" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="2">SELECT count(*) FROM pg_roles WHERE rolname IN ('zc_app', 'zc_housekeeping')</sqlCheck>
+        </preConditions>
+        <comment>Grant the application privileges on the integration tables; append-only tables get no UPDATE, and no table gets DELETE.</comment>
+        <sql splitStatements="false"><![CDATA[
+GRANT SELECT, INSERT, UPDATE ON zc_idempotency_key TO zc_app;
+GRANT SELECT, DELETE ON zc_idempotency_key TO zc_housekeeping;
+GRANT USAGE ON SEQUENCE zc_idempotency_key_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_integration_outbox TO zc_app;
+GRANT USAGE ON SEQUENCE zc_integration_outbox_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_integration_inbox TO zc_app;
+GRANT USAGE ON SEQUENCE zc_integration_inbox_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_dead_letter TO zc_app;
+GRANT USAGE ON SEQUENCE zc_dead_letter_id_seq TO zc_app;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+REVOKE ALL ON zc_idempotency_key FROM zc_app, zc_housekeeping;
+REVOKE USAGE ON SEQUENCE zc_idempotency_key_id_seq FROM zc_app;
+REVOKE ALL ON zc_integration_outbox FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_integration_outbox_id_seq FROM zc_app;
+REVOKE ALL ON zc_integration_inbox FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_integration_inbox_id_seq FROM zc_app;
+REVOKE ALL ON zc_dead_letter FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_dead_letter_id_seq FROM zc_app;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+</databaseChangeLog>

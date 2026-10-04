@@ -1,0 +1,314 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- 20260929_06_cohort.xml -->
+    <!-- Population and Cohort: cohorts, identification runs and cohort membership. -->
+    <!-- Owned by the cohort domain: com.zimasahealth.zcare.domains.cohort (roadmap milestone M6). -->
+    <!-- Source: agreed design V001 section 04 and V002 grants. Author: adam16wilson7136 -->
+
+    <!-- 1. Tables, with their keys, checks, indexes and comments -->
+    <changeSet id="20260929-06-01" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_cohort"/></not>
+        </preConditions>
+        <comment>Create table zc_cohort.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_cohort (
+  id                    bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id             bigint NOT NULL,
+  programme_version_id  bigint NOT NULL,
+  code                  text NOT NULL,
+  name                  text NOT NULL,
+  status                text NOT NULL DEFAULT 'draft',
+  description           text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_cohort_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_cohort_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_cohort PRIMARY KEY (id),
+  CONSTRAINT uq_zc_cohort_fk_target UNIQUE (tenant_id, id),
+  CONSTRAINT uq_zc_cohort_code UNIQUE (tenant_id, programme_version_id, code),
+  CONSTRAINT ck_zc_cohort_code CHECK (btrim(code) <> ''),
+  CONSTRAINT ck_zc_cohort_name CHECK (btrim(name) <> ''),
+  CONSTRAINT ck_zc_cohort_status CHECK (status IN ('draft','active','closed'))
+);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_cohort"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-06-02" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_cohort_run"/></not>
+        </preConditions>
+        <comment>Create table zc_cohort_run.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_cohort_run (
+  id                bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id         bigint NOT NULL,
+  cohort_id         bigint NOT NULL,
+  status            text NOT NULL DEFAULT 'running',
+  rule_reference    text NOT NULL,
+  started_at        timestamptz NOT NULL DEFAULT now(),
+  finished_at       timestamptz,
+  source_data_date  date,
+  result_count      integer,
+  hold_reason       text,
+  reviewed_by       text,
+  reviewed_at       timestamptz,
+  failure_reason    text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_cohort_run_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_cohort_run_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_cohort_run PRIMARY KEY (id),
+  CONSTRAINT uq_zc_cohort_run_fk_cohort UNIQUE (tenant_id, id, cohort_id),
+  CONSTRAINT ck_zc_cohort_run_status CHECK (status IN ('running','pending_review','completed','failed','rejected')),
+  CONSTRAINT ck_zc_cohort_run_rule_reference CHECK (btrim(rule_reference) <> ''),
+  CONSTRAINT ck_zc_cohort_run_result_count CHECK (result_count IS NULL OR result_count >= 0),
+  -- Held runs need a reason.
+  CONSTRAINT ck_zc_cohort_run_hold CHECK (status <> 'pending_review' OR nullif(btrim(hold_reason), '') IS NOT NULL),
+  CONSTRAINT ck_zc_cohort_run_finished CHECK (status NOT IN ('completed','failed','rejected') OR finished_at IS NOT NULL),
+  CONSTRAINT ck_zc_cohort_run_failure CHECK (status <> 'failed' OR nullif(btrim(failure_reason), '') IS NOT NULL),
+  CONSTRAINT ck_zc_cohort_run_review_pair CHECK ((reviewed_by IS NULL) = (reviewed_at IS NULL)),
+  CONSTRAINT ck_zc_cohort_run_rejected CHECK (status <> 'rejected' OR reviewed_by IS NOT NULL)
+);
+CREATE INDEX ix_zc_cohort_run_cohort ON zc_cohort_run (tenant_id, cohort_id, started_at DESC);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_cohort_run"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-06-03" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_cohort_membership"/></not>
+        </preConditions>
+        <comment>Create table zc_cohort_membership.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_cohort_membership (
+  id                       bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id                bigint NOT NULL,
+  cohort_id                bigint NOT NULL,
+  member_id                bigint NOT NULL,
+  cohort_run_id            bigint,
+  inclusion_method         text NOT NULL,
+  inclusion_source_detail  text,   -- free text from adapter
+  inclusion_reason         text NOT NULL,
+  source_data_date         date NOT NULL,
+  status                   text NOT NULL DEFAULT 'included',
+  removed_at               timestamptz,
+  removed_by               text,
+  removal_reason           text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_cohort_membership_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_cohort_membership_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_cohort_membership PRIMARY KEY (id),
+  CONSTRAINT uq_zc_cohort_membership_fk_member UNIQUE (tenant_id, id, member_id),
+  CONSTRAINT uq_zc_cohort_membership_member UNIQUE (tenant_id, cohort_id, member_id),
+  CONSTRAINT ck_zc_cohort_membership_inclusion_method CHECK (
+    inclusion_method IN ('payer_flagged','claims_derived','manual','imported')),
+  CONSTRAINT ck_zc_cohort_membership_run_provenance CHECK (
+    inclusion_method IN ('manual','imported') OR cohort_run_id IS NOT NULL),
+  CONSTRAINT ck_zc_cohort_membership_reason CHECK (btrim(inclusion_reason) <> ''),
+  CONSTRAINT ck_zc_cohort_membership_status CHECK (status IN ('included','removed')),
+  CONSTRAINT ck_zc_cohort_membership_removal CHECK (
+    status <> 'removed'
+    OR (removed_at IS NOT NULL
+        AND nullif(btrim(removed_by), '') IS NOT NULL
+        AND nullif(btrim(removal_reason), '') IS NOT NULL))
+);
+COMMENT ON TABLE zc_cohort_membership IS 'Eligibility for invitation. Membership <> enrolment <> consent: three distinct gates.';
+CREATE INDEX ix_zc_cohort_membership_member ON zc_cohort_membership (tenant_id, member_id);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_cohort_membership"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 2. Foreign keys, after every referenced table exists -->
+    <changeSet id="20260929-06-04" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_programme_version"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_cohort'::regclass AND conname IN ('fk_zc_cohort_tenant', 'fk_zc_cohort_programme_version')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_cohort.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_cohort
+  ADD CONSTRAINT fk_zc_cohort_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_cohort
+  ADD CONSTRAINT fk_zc_cohort_programme_version FOREIGN KEY (tenant_id, programme_version_id)
+    REFERENCES zc_programme_version (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_cohort" constraintName="fk_zc_cohort_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_cohort" constraintName="fk_zc_cohort_programme_version"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-06-05" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_cohort"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_cohort_run'::regclass AND conname IN ('fk_zc_cohort_run_tenant', 'fk_zc_cohort_run_cohort')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_cohort_run.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_cohort_run
+  ADD CONSTRAINT fk_zc_cohort_run_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_cohort_run
+  ADD CONSTRAINT fk_zc_cohort_run_cohort FOREIGN KEY (tenant_id, cohort_id)
+    REFERENCES zc_cohort (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_cohort_run" constraintName="fk_zc_cohort_run_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_cohort_run" constraintName="fk_zc_cohort_run_cohort"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-06-06" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_cohort"/>
+            <tableExists schemaName="public" tableName="zc_member_reference"/>
+            <tableExists schemaName="public" tableName="zc_cohort_run"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_cohort_membership'::regclass AND conname IN ('fk_zc_cohort_membership_tenant', 'fk_zc_cohort_membership_cohort', 'fk_zc_cohort_membership_member', 'fk_zc_cohort_membership_cohort_run')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_cohort_membership.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_cohort_membership
+  ADD CONSTRAINT fk_zc_cohort_membership_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_cohort_membership
+  ADD CONSTRAINT fk_zc_cohort_membership_cohort FOREIGN KEY (tenant_id, cohort_id)
+    REFERENCES zc_cohort (tenant_id, id);
+ALTER TABLE zc_cohort_membership
+  ADD CONSTRAINT fk_zc_cohort_membership_member FOREIGN KEY (tenant_id, member_id)
+    REFERENCES zc_member_reference (tenant_id, id);
+-- Run must belong to the same cohort.
+ALTER TABLE zc_cohort_membership
+  ADD CONSTRAINT fk_zc_cohort_membership_cohort_run FOREIGN KEY (tenant_id, cohort_run_id, cohort_id)
+    REFERENCES zc_cohort_run (tenant_id, id, cohort_id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_cohort_membership" constraintName="fk_zc_cohort_membership_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_cohort_membership" constraintName="fk_zc_cohort_membership_cohort"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_cohort_membership" constraintName="fk_zc_cohort_membership_member"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_cohort_membership" constraintName="fk_zc_cohort_membership_cohort_run"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 3. Triggers -->
+    <changeSet id="20260929-06-07" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_cohort'::regclass AND tgname IN ('trg_zc_cohort_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_cohort.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_cohort_touch BEFORE UPDATE ON zc_cohort FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_cohort_touch ON zc_cohort;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-06-08" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_cohort_run'::regclass AND tgname IN ('trg_zc_cohort_run_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_cohort_run.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_cohort_run_touch BEFORE UPDATE ON zc_cohort_run FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_cohort_run_touch ON zc_cohort_run;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-06-09" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_cohort_membership'::regclass AND tgname IN ('trg_zc_cohort_membership_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_cohort_membership.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_cohort_membership_touch BEFORE UPDATE ON zc_cohort_membership FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_cohort_membership_touch ON zc_cohort_membership;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 4. Tenant isolation (row-level security) -->
+    <changeSet id="20260929-06-10" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_policy WHERE polname IN ('rls_zc_cohort_tenant', 'rls_zc_cohort_run_tenant', 'rls_zc_cohort_membership_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Enable and force row-level security, with a tenant policy, on zc_cohort, zc_cohort_run, zc_cohort_membership.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Tenant isolation. The app must connect as zc_app: superusers bypass RLS.
+ALTER TABLE zc_cohort ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_cohort FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_cohort_tenant ON zc_cohort
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_cohort_run ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_cohort_run FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_cohort_run_tenant ON zc_cohort_run
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_cohort_membership ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_cohort_membership FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_cohort_membership_tenant ON zc_cohort_membership
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP POLICY rls_zc_cohort_tenant ON zc_cohort;
+ALTER TABLE zc_cohort NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_cohort DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_cohort_run_tenant ON zc_cohort_run;
+ALTER TABLE zc_cohort_run NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_cohort_run DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_cohort_membership_tenant ON zc_cohort_membership;
+ALTER TABLE zc_cohort_membership NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_cohort_membership DISABLE ROW LEVEL SECURITY;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 5. Privileges for zc_app and zc_housekeeping -->
+    <changeSet id="20260929-06-11" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="2">SELECT count(*) FROM pg_roles WHERE rolname IN ('zc_app', 'zc_housekeeping')</sqlCheck>
+        </preConditions>
+        <comment>Grant the application privileges on the cohort tables; append-only tables get no UPDATE, and no table gets DELETE.</comment>
+        <sql splitStatements="false"><![CDATA[
+GRANT SELECT, INSERT, UPDATE ON zc_cohort TO zc_app;
+GRANT USAGE ON SEQUENCE zc_cohort_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_cohort_run TO zc_app;
+GRANT USAGE ON SEQUENCE zc_cohort_run_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_cohort_membership TO zc_app;
+GRANT USAGE ON SEQUENCE zc_cohort_membership_id_seq TO zc_app;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+REVOKE ALL ON zc_cohort FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_cohort_id_seq FROM zc_app;
+REVOKE ALL ON zc_cohort_run FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_cohort_run_id_seq FROM zc_app;
+REVOKE ALL ON zc_cohort_membership FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_cohort_membership_id_seq FROM zc_app;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+</databaseChangeLog>

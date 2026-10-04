@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- 20260929_20_security_posture_checks.xml -->
+    <!-- Read-only checks, run on every update, that the application role still owns nothing, holds
+         no DELETE, cannot update append-only tables, and that every tenant table has row-level
+         security. -->
+    <!-- Source: agreed design V002 (sanity checks). Author: adam16wilson7136 -->
+
+    <!-- Runs on every update; read-only, so there is nothing to roll back. -->
+    <changeSet id="20260929-20-01" author="adam16wilson7136" dbms="postgresql" runAlways="true" runOnChange="true">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="2">SELECT count(*) FROM pg_roles WHERE rolname IN ('zc_app', 'zc_housekeeping')</sqlCheck>
+        </preConditions>
+        <comment>Verify the application-role posture: zc_app owns nothing, holds no DELETE or TRUNCATE, cannot update append-only tables, and every tenant table has enabled, forced row-level security with a policy.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Sanity checks.
+DO $do$
+DECLARE
+  v_bad text;
+BEGIN
+  -- 1. zc_app owns nothing.
+  SELECT string_agg(c.relname, ', ') INTO v_bad
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname = 'public' AND c.relname LIKE 'zc\_%' AND c.relkind = 'r'
+     AND pg_has_role('zc_app', c.relowner, 'MEMBER');
+  IF v_bad IS NOT NULL THEN
+    RAISE EXCEPTION 'zc_app owns (or is a member of the owner of): %', v_bad;
+  END IF;
+
+  -- 2. zc_app has no DELETE / TRUNCATE anywhere.
+  SELECT string_agg(c.relname, ', ') INTO v_bad
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname = 'public' AND c.relname LIKE 'zc\_%' AND c.relkind = 'r'
+     AND (has_table_privilege('zc_app', c.oid, 'DELETE') OR has_table_privilege('zc_app', c.oid, 'TRUNCATE'));
+  IF v_bad IS NOT NULL THEN
+    RAISE EXCEPTION 'zc_app must hold no DELETE/TRUNCATE, but has it on: %', v_bad;
+  END IF;
+
+  -- 3. zc_app has no UPDATE on append-only tables.
+  SELECT string_agg(t, ', ') INTO v_bad
+    FROM unnest(ARRAY['zc_config_history', 'zc_assessment_response', 'zc_risk_classification', 'zc_plan_review', 'zc_task_assignment_history', 'zc_provider_action', 'zc_report_snapshot', 'zc_domain_audit', 'zc_security_event'
+                ]::text[]) AS t
+   WHERE has_table_privilege('zc_app', t, 'UPDATE');
+  IF v_bad IS NOT NULL THEN
+    RAISE EXCEPTION 'zc_app must hold no UPDATE on append-only tables, but has it on: %', v_bad;
+  END IF;
+
+  -- 4. RLS enabled, forced and has a policy.
+  SELECT string_agg(c.relname, ', ') INTO v_bad
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname = 'public' AND c.relname LIKE 'zc\_%' AND c.relkind = 'r'
+     AND c.relname NOT IN ('zc_tenant','zc_security_event','zc_user','zc_tenant_whatsapp')
+     AND (NOT c.relrowsecurity OR NOT c.relforcerowsecurity
+          OR NOT EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = c.oid));
+  IF v_bad IS NOT NULL THEN
+    RAISE EXCEPTION 'tables missing enabled+forced RLS or a policy: %', v_bad;
+  END IF;
+END
+$do$;
+        ]]></sql>
+        <rollback/>
+    </changeSet>
+</databaseChangeLog>

@@ -1,0 +1,312 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- 20260929_08_assessment.xml -->
+    <!-- Assessment and Risk: assessments pinned to a template version, append-only responses and
+         append-only priority classification. -->
+    <!-- Owned by the assessment domain: com.zimasahealth.zcare.domains.assessment (roadmap milestone M8). -->
+    <!-- Source: agreed design V001 section 06 and V002 grants. Author: adam16wilson7136 -->
+
+    <!-- 1. Tables, with their keys, checks, indexes and comments -->
+    <changeSet id="20260929-08-01" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_assessment"/></not>
+        </preConditions>
+        <comment>Create table zc_assessment.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_assessment (
+  id                   bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id            bigint NOT NULL,
+  enrolment_id         bigint NOT NULL,
+  template_version_id  bigint NOT NULL,
+  status               text NOT NULL DEFAULT 'assigned',
+  assigned_at          timestamptz NOT NULL DEFAULT now(),
+  due_at               timestamptz,
+  completed_at         timestamptz,
+  score                numeric,
+  score_detail         jsonb,
+  cancel_reason        text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_assessment_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_assessment_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_assessment PRIMARY KEY (id),
+  CONSTRAINT uq_zc_assessment_fk_target    UNIQUE (tenant_id, id),
+  CONSTRAINT uq_zc_assessment_fk_enrolment UNIQUE (tenant_id, id, enrolment_id),
+  CONSTRAINT ck_zc_assessment_status CHECK (status IN ('assigned','in_progress','completed','cancelled','expired')),
+  CONSTRAINT ck_zc_assessment_completed CHECK (status <> 'completed' OR completed_at IS NOT NULL),
+  CONSTRAINT ck_zc_assessment_cancelled CHECK (status <> 'cancelled' OR nullif(btrim(cancel_reason), '') IS NOT NULL)
+);
+COMMENT ON COLUMN zc_assessment.template_version_id IS
+  'Pinned at assignment (trg_zc_assessment_pins): responses always score against the version live when assigned.';
+COMMENT ON COLUMN zc_assessment.score_detail IS 'jsonb: explainability payload for the computed score.';
+CREATE INDEX ix_zc_assessment_enrolment ON zc_assessment (tenant_id, enrolment_id, assigned_at DESC);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_assessment"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-08-02" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_assessment_response"/></not>
+        </preConditions>
+        <comment>Create table zc_assessment_response.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_assessment_response (
+  id             bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id      bigint NOT NULL,
+  assessment_id  bigint NOT NULL,
+  question_code  text NOT NULL,
+  answer_value   text,
+  answered_at    timestamptz NOT NULL DEFAULT now(),
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_assessment_response_created_by CHECK (btrim(created_by) <> ''),
+  CONSTRAINT pk_zc_assessment_response PRIMARY KEY (id),
+  CONSTRAINT ck_zc_assessment_response_question CHECK (btrim(question_code) <> '')
+);
+COMMENT ON TABLE zc_assessment_response IS 'Append-only. A changed answer is a new row; the latest answered_at wins.';
+CREATE INDEX ix_zc_assessment_response_assessment
+  ON zc_assessment_response (tenant_id, assessment_id, question_code, answered_at DESC);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_assessment_response"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-08-03" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_risk_classification"/></not>
+        </preConditions>
+        <comment>Create table zc_risk_classification.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_risk_classification (
+  id               bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id        bigint NOT NULL,
+  enrolment_id     bigint NOT NULL,
+  assessment_id    bigint,
+  overrides_id     bigint,
+  priority_tier    text NOT NULL,   -- TODO: approved tier names
+  derived_from     text NOT NULL,
+  is_override      boolean NOT NULL DEFAULT false,
+  override_reason  text,
+  rationale        text,
+  classified_at    timestamptz NOT NULL DEFAULT now(),
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_risk_classification_created_by CHECK (btrim(created_by) <> ''),
+  CONSTRAINT pk_zc_risk_classification PRIMARY KEY (id),
+  CONSTRAINT uq_zc_risk_classification_fk_enrolment UNIQUE (tenant_id, id, enrolment_id),
+  CONSTRAINT ck_zc_risk_classification_tier CHECK (btrim(priority_tier) <> ''),
+  CONSTRAINT ck_zc_risk_classification_derived_from CHECK (derived_from IN ('assessment','manual')),
+  CONSTRAINT ck_zc_risk_classification_derivation CHECK (derived_from <> 'assessment' OR assessment_id IS NOT NULL),
+  CONSTRAINT ck_zc_risk_classification_override CHECK (
+    is_override = (overrides_id IS NOT NULL)
+    AND (NOT is_override OR nullif(btrim(override_reason), '') IS NOT NULL)),
+  CONSTRAINT ck_zc_risk_classification_not_self CHECK (overrides_id IS NULL OR overrides_id <> id)
+);
+COMMENT ON TABLE zc_risk_classification IS
+  'Append-only programme/operational priority tier. NEVER a diagnosis. An override inserts a new row pointing back via overrides_id.';
+CREATE INDEX ix_zc_risk_classification_current ON zc_risk_classification (tenant_id, enrolment_id, classified_at DESC);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_risk_classification"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 2. Foreign keys, after every referenced table exists -->
+    <changeSet id="20260929-08-04" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_enrolment"/>
+            <tableExists schemaName="public" tableName="zc_assessment_template_version"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_assessment'::regclass AND conname IN ('fk_zc_assessment_tenant', 'fk_zc_assessment_enrolment', 'fk_zc_assessment_template_version')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_assessment.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_assessment
+  ADD CONSTRAINT fk_zc_assessment_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_assessment
+  ADD CONSTRAINT fk_zc_assessment_enrolment FOREIGN KEY (tenant_id, enrolment_id)
+    REFERENCES zc_enrolment (tenant_id, id);
+ALTER TABLE zc_assessment
+  ADD CONSTRAINT fk_zc_assessment_template_version FOREIGN KEY (tenant_id, template_version_id)
+    REFERENCES zc_assessment_template_version (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_assessment" constraintName="fk_zc_assessment_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_assessment" constraintName="fk_zc_assessment_enrolment"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_assessment" constraintName="fk_zc_assessment_template_version"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-08-05" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_assessment"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_assessment_response'::regclass AND conname IN ('fk_zc_assessment_response_tenant', 'fk_zc_assessment_response_assessment')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_assessment_response.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_assessment_response
+  ADD CONSTRAINT fk_zc_assessment_response_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_assessment_response
+  ADD CONSTRAINT fk_zc_assessment_response_assessment FOREIGN KEY (tenant_id, assessment_id)
+    REFERENCES zc_assessment (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_assessment_response" constraintName="fk_zc_assessment_response_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_assessment_response" constraintName="fk_zc_assessment_response_assessment"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-08-06" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_enrolment"/>
+            <tableExists schemaName="public" tableName="zc_assessment"/>
+            <tableExists schemaName="public" tableName="zc_risk_classification"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_risk_classification'::regclass AND conname IN ('fk_zc_risk_classification_tenant', 'fk_zc_risk_classification_enrolment', 'fk_zc_risk_classification_assessment', 'fk_zc_risk_classification_overrides')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_risk_classification.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_risk_classification
+  ADD CONSTRAINT fk_zc_risk_classification_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_risk_classification
+  ADD CONSTRAINT fk_zc_risk_classification_enrolment FOREIGN KEY (tenant_id, enrolment_id)
+    REFERENCES zc_enrolment (tenant_id, id);
+ALTER TABLE zc_risk_classification
+  ADD CONSTRAINT fk_zc_risk_classification_assessment FOREIGN KEY (tenant_id, assessment_id, enrolment_id)
+    REFERENCES zc_assessment (tenant_id, id, enrolment_id);
+ALTER TABLE zc_risk_classification
+  ADD CONSTRAINT fk_zc_risk_classification_overrides FOREIGN KEY (tenant_id, overrides_id, enrolment_id)
+    REFERENCES zc_risk_classification (tenant_id, id, enrolment_id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_risk_classification" constraintName="fk_zc_risk_classification_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_risk_classification" constraintName="fk_zc_risk_classification_enrolment"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_risk_classification" constraintName="fk_zc_risk_classification_assessment"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_risk_classification" constraintName="fk_zc_risk_classification_overrides"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 3. Triggers -->
+    <changeSet id="20260929-08-07" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_assessment'::regclass AND tgname IN ('trg_zc_assessment_pins', 'trg_zc_assessment_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_assessment.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_assessment_pins
+  BEFORE UPDATE ON zc_assessment
+  FOR EACH ROW EXECUTE FUNCTION zc_forbid_pinned_change(
+    'trg_zc_assessment_pins', 'enrolment_id', 'template_version_id');
+CREATE TRIGGER trg_zc_assessment_touch BEFORE UPDATE ON zc_assessment FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_assessment_pins ON zc_assessment;
+DROP TRIGGER trg_zc_assessment_touch ON zc_assessment;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-08-08" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_assessment_response'::regclass AND tgname IN ('trg_zc_assessment_response_append_only', 'trg_zc_assessment_response_no_truncate')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_assessment_response.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_assessment_response_append_only BEFORE UPDATE OR DELETE ON zc_assessment_response FOR EACH ROW EXECUTE FUNCTION zc_forbid_change('trg_zc_assessment_response_append_only');
+CREATE TRIGGER trg_zc_assessment_response_no_truncate BEFORE TRUNCATE ON zc_assessment_response FOR EACH STATEMENT EXECUTE FUNCTION zc_forbid_change('trg_zc_assessment_response_append_only');
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_assessment_response_append_only ON zc_assessment_response;
+DROP TRIGGER trg_zc_assessment_response_no_truncate ON zc_assessment_response;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-08-09" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_risk_classification'::regclass AND tgname IN ('trg_zc_risk_classification_append_only', 'trg_zc_risk_classification_no_truncate')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_risk_classification.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_risk_classification_append_only BEFORE UPDATE OR DELETE ON zc_risk_classification FOR EACH ROW EXECUTE FUNCTION zc_forbid_change('trg_zc_risk_classification_append_only');
+CREATE TRIGGER trg_zc_risk_classification_no_truncate BEFORE TRUNCATE ON zc_risk_classification FOR EACH STATEMENT EXECUTE FUNCTION zc_forbid_change('trg_zc_risk_classification_append_only');
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_risk_classification_append_only ON zc_risk_classification;
+DROP TRIGGER trg_zc_risk_classification_no_truncate ON zc_risk_classification;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 4. Tenant isolation (row-level security) -->
+    <changeSet id="20260929-08-10" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_policy WHERE polname IN ('rls_zc_assessment_tenant', 'rls_zc_assessment_response_tenant', 'rls_zc_risk_classification_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Enable and force row-level security, with a tenant policy, on zc_assessment, zc_assessment_response, zc_risk_classification.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Tenant isolation. The app must connect as zc_app: superusers bypass RLS.
+ALTER TABLE zc_assessment ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_assessment FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_assessment_tenant ON zc_assessment
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_assessment_response ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_assessment_response FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_assessment_response_tenant ON zc_assessment_response
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_risk_classification ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_risk_classification FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_risk_classification_tenant ON zc_risk_classification
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP POLICY rls_zc_assessment_tenant ON zc_assessment;
+ALTER TABLE zc_assessment NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_assessment DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_assessment_response_tenant ON zc_assessment_response;
+ALTER TABLE zc_assessment_response NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_assessment_response DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_risk_classification_tenant ON zc_risk_classification;
+ALTER TABLE zc_risk_classification NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_risk_classification DISABLE ROW LEVEL SECURITY;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 5. Privileges for zc_app and zc_housekeeping -->
+    <changeSet id="20260929-08-11" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="2">SELECT count(*) FROM pg_roles WHERE rolname IN ('zc_app', 'zc_housekeeping')</sqlCheck>
+        </preConditions>
+        <comment>Grant the application privileges on the assessment tables; append-only tables get no UPDATE, and no table gets DELETE.</comment>
+        <sql splitStatements="false"><![CDATA[
+GRANT SELECT, INSERT, UPDATE ON zc_assessment TO zc_app;
+GRANT USAGE ON SEQUENCE zc_assessment_id_seq TO zc_app;
+GRANT SELECT, INSERT ON zc_assessment_response TO zc_app;
+REVOKE UPDATE, DELETE, TRUNCATE ON zc_assessment_response FROM zc_app;
+GRANT USAGE ON SEQUENCE zc_assessment_response_id_seq TO zc_app;
+GRANT SELECT, INSERT ON zc_risk_classification TO zc_app;
+REVOKE UPDATE, DELETE, TRUNCATE ON zc_risk_classification FROM zc_app;
+GRANT USAGE ON SEQUENCE zc_risk_classification_id_seq TO zc_app;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+REVOKE ALL ON zc_assessment FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_assessment_id_seq FROM zc_app;
+REVOKE ALL ON zc_assessment_response FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_assessment_response_id_seq FROM zc_app;
+REVOKE ALL ON zc_risk_classification FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_risk_classification_id_seq FROM zc_app;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+</databaseChangeLog>

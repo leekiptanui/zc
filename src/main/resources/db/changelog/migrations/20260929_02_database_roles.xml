@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- 20260929_02_database_roles.xml -->
+    <!-- The zc_app application role and the zc_housekeeping role, and the schema privileges they
+         hold. Table grants live with each table. -->
+    <!-- Source: agreed design V002. Author: adam16wilson7136 -->
+
+    <!-- 1. Roles -->
+    <changeSet id="20260929-02-01" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_roles WHERE rolname IN ('zc_app', 'zc_housekeeping') AND (rolsuper OR rolbypassrls OR rolcreaterole)</sqlCheck>
+        </preConditions>
+        <comment>Create the zc_app and zc_housekeeping roles if they are not provisioned already, and refuse widened ones.</comment>
+        <sql splitStatements="false"><![CDATA[
+DO $do$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'zc_app') THEN
+    CREATE ROLE zc_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
+  END IF;
+  -- Deletes expired idempotency keys only. Subject to RLS.
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'zc_housekeeping') THEN
+    CREATE ROLE zc_housekeeping NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+  END IF;
+END
+$do$;
+
+-- Check existing roles weren't widened.
+DO $do$
+DECLARE r record;
+BEGIN
+  FOR r IN SELECT rolname, rolsuper, rolbypassrls, rolcreaterole
+             FROM pg_roles WHERE rolname IN ('zc_app','zc_housekeeping') LOOP
+    IF r.rolsuper OR r.rolbypassrls OR r.rolcreaterole THEN
+      RAISE EXCEPTION '% must not be SUPERUSER, BYPASSRLS or CREATEROLE - RLS would be inert', r.rolname;
+    END IF;
+  END LOOP;
+END
+$do$;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+-- Roles are cluster-wide and may hold privileges in other databases: drop each only if nothing depends on it.
+DO $rb$
+BEGIN
+  BEGIN
+    DROP ROLE IF EXISTS zc_housekeeping;
+  EXCEPTION WHEN dependent_objects_still_exist THEN
+    RAISE NOTICE 'zc_housekeeping kept: other objects depend on it';
+  END;
+  BEGIN
+    DROP ROLE IF EXISTS zc_app;
+  EXCEPTION WHEN dependent_objects_still_exist THEN
+    RAISE NOTICE 'zc_app kept: other objects depend on it';
+  END;
+END
+$rb$;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 2. Schema privileges -->
+    <changeSet id="20260929-02-02" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="2">SELECT count(*) FROM pg_roles WHERE rolname IN ('zc_app', 'zc_housekeeping')</sqlCheck>
+        </preConditions>
+        <comment>Only the owner creates objects in schema public; the two roles may use it.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Only the owner creates objects.
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO zc_app, zc_housekeeping;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+REVOKE USAGE ON SCHEMA public FROM zc_app, zc_housekeeping;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+</databaseChangeLog>

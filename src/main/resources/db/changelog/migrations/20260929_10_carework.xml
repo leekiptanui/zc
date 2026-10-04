@@ -1,0 +1,433 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- 20260929_10_carework.xml -->
+    <!-- Care Work: tasks, task dependencies, append-only assignment history and work-queue
+         definitions. -->
+    <!-- Owned by the carework domain: com.zimasahealth.zcare.domains.carework (roadmap milestone M10). -->
+    <!-- Source: agreed design V001 section 08 and V002 grants. Author: adam16wilson7136 -->
+
+    <!-- 1. Tables, with their keys, checks, indexes and comments -->
+    <changeSet id="20260929-10-01" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_task"/></not>
+        </preConditions>
+        <comment>Create table zc_task.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_task (
+  id                 bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id          bigint NOT NULL,
+  enrolment_id       bigint NOT NULL,
+  member_id          bigint NOT NULL,
+  task_type          text NOT NULL,
+  title              text,
+  description        text,
+  priority           smallint NOT NULL DEFAULT 3,   -- 1 = most urgent
+  status             text NOT NULL DEFAULT 'assigned',
+  assigned_to_actor  text,
+  assigned_to_role   text,
+  due_at             timestamptz,   -- SLA deadline
+  sla_state          text NOT NULL DEFAULT 'on_track',   -- set by the SLA job
+  origin_type        text NOT NULL DEFAULT 'manual',
+  origin_id          bigint,        -- polymorphic, no FK
+  blocked_reason     text,
+  completed_at       timestamptz,
+  completed_by       text,
+  completion_note    text,
+  cancelled_at       timestamptz,
+  cancel_reason      text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_task_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_task_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_task PRIMARY KEY (id),
+  CONSTRAINT uq_zc_task_fk_target UNIQUE (tenant_id, id),
+  CONSTRAINT uq_zc_task_fk_member UNIQUE (tenant_id, id, member_id),
+  CONSTRAINT ck_zc_task_task_type CHECK (btrim(task_type) <> ''),
+  CONSTRAINT ck_zc_task_priority CHECK (priority BETWEEN 1 AND 5),
+  CONSTRAINT ck_zc_task_status CHECK (status IN ('assigned','accepted','in_progress','blocked','completed','cancelled')),
+  CONSTRAINT ck_zc_task_sla_state CHECK (sla_state IN ('on_track','at_risk','breached','not_applicable')),
+  -- Assigned to a person or a role.
+  CONSTRAINT ck_zc_task_assignee CHECK (
+    nullif(btrim(assigned_to_actor), '') IS NOT NULL OR nullif(btrim(assigned_to_role), '') IS NOT NULL),
+  CONSTRAINT ck_zc_task_origin_type CHECK (origin_type IN (
+    'manual','care_plan','intervention','care_gap','referral','transition','refill_request',
+    'assessment','observation','outreach_request','inbound_message','dead_letter','task_template')),
+  CONSTRAINT ck_zc_task_origin CHECK (origin_type = 'manual' OR origin_id IS NOT NULL),
+  CONSTRAINT ck_zc_task_blocked CHECK (status <> 'blocked' OR nullif(btrim(blocked_reason), '') IS NOT NULL),
+  CONSTRAINT ck_zc_task_completion CHECK (
+    status <> 'completed' OR (nullif(btrim(completed_by), '') IS NOT NULL AND completed_at IS NOT NULL)),
+  CONSTRAINT ck_zc_task_cancellation CHECK (
+    status <> 'cancelled' OR nullif(btrim(cancel_reason), '') IS NOT NULL)
+);
+-- Work queues.
+CREATE INDEX ix_zc_task_queue
+  ON zc_task (tenant_id, assigned_to_actor, status, priority, due_at)
+  WHERE status IN ('assigned','accepted','in_progress','blocked');
+CREATE INDEX ix_zc_task_team_queue
+  ON zc_task (tenant_id, assigned_to_role, status, priority, due_at)
+  WHERE status IN ('assigned','accepted','in_progress','blocked');
+CREATE INDEX ix_zc_task_enrolment ON zc_task (tenant_id, enrolment_id, status);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_task"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-10-02" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_task_dependency"/></not>
+        </preConditions>
+        <comment>Create table zc_task_dependency.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_task_dependency (
+  id                  bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id           bigint NOT NULL,
+  task_id             bigint NOT NULL,
+  depends_on_task_id  bigint NOT NULL,
+  removed_at          timestamptz,   -- soft delete
+  removed_by          text,
+  removal_reason      text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_task_dependency_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_task_dependency_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_task_dependency PRIMARY KEY (id),
+  CONSTRAINT ck_zc_task_dependency_not_self CHECK (task_id <> depends_on_task_id),
+  CONSTRAINT ck_zc_task_dependency_removal CHECK (
+    (removed_at IS NULL AND removed_by IS NULL AND removal_reason IS NULL)
+    OR (removed_at IS NOT NULL
+        AND nullif(btrim(removed_by), '') IS NOT NULL
+        AND nullif(btrim(removal_reason), '') IS NOT NULL))
+);
+CREATE UNIQUE INDEX uq_zc_task_dependency_pair
+  ON zc_task_dependency (tenant_id, task_id, depends_on_task_id) WHERE removed_at IS NULL;
+CREATE INDEX ix_zc_task_dependency_depends_on ON zc_task_dependency (tenant_id, depends_on_task_id);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_task_dependency"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-10-03" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_task_assignment_history"/></not>
+        </preConditions>
+        <comment>Create table zc_task_assignment_history.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_task_assignment_history (
+  id           bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id    bigint NOT NULL,
+  task_id      bigint NOT NULL,
+  from_actor   text,
+  to_actor     text,
+  from_role    text,
+  to_role      text,
+  reason       text,
+  assigned_at  timestamptz NOT NULL DEFAULT now(),
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_task_assignment_history_created_by CHECK (btrim(created_by) <> ''),
+  CONSTRAINT pk_zc_task_assignment_history PRIMARY KEY (id),
+  CONSTRAINT ck_zc_task_assignment_history_target CHECK (
+    nullif(btrim(to_actor), '') IS NOT NULL OR nullif(btrim(to_role), '') IS NOT NULL)
+);
+CREATE INDEX ix_zc_task_assignment_history_task ON zc_task_assignment_history (tenant_id, task_id, assigned_at);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_task_assignment_history"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-10-04" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_work_queue_definition"/></not>
+        </preConditions>
+        <comment>Create table zc_work_queue_definition.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_work_queue_definition (
+  id                 bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id          bigint NOT NULL,
+  code               text NOT NULL,
+  name               text NOT NULL,
+  role_code          text,
+  scope              text NOT NULL,
+  filter_definition  jsonb NOT NULL DEFAULT '{}'::jsonb,
+  is_active          boolean NOT NULL DEFAULT true,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_work_queue_definition_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_work_queue_definition_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_work_queue_definition PRIMARY KEY (id),
+  CONSTRAINT uq_zc_work_queue_definition_code UNIQUE (tenant_id, code),
+  CONSTRAINT ck_zc_work_queue_definition_code  CHECK (btrim(code) <> ''),
+  CONSTRAINT ck_zc_work_queue_definition_name  CHECK (btrim(name) <> ''),
+  CONSTRAINT ck_zc_work_queue_definition_scope CHECK (btrim(scope) <> '')
+);
+COMMENT ON TABLE zc_work_queue_definition IS
+  'A queue is a live query over zc_task, not a stored relationship. No FK beyond tenant_id.';
+COMMENT ON COLUMN zc_work_queue_definition.filter_definition IS
+  'jsonb: the stored queue filter. Read by the query layer only; no domain invariant lives in it.';
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_work_queue_definition"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 2. Foreign keys, after every referenced table exists -->
+    <changeSet id="20260929-10-05" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_enrolment"/>
+            <tableExists schemaName="public" tableName="zc_member_reference"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_task'::regclass AND conname IN ('fk_zc_task_tenant', 'fk_zc_task_enrolment', 'fk_zc_task_member')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_task.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_task
+  ADD CONSTRAINT fk_zc_task_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_task
+  ADD CONSTRAINT fk_zc_task_enrolment FOREIGN KEY (tenant_id, enrolment_id, member_id)
+    REFERENCES zc_enrolment (tenant_id, id, member_id);
+ALTER TABLE zc_task
+  ADD CONSTRAINT fk_zc_task_member FOREIGN KEY (tenant_id, member_id)
+    REFERENCES zc_member_reference (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_task" constraintName="fk_zc_task_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_task" constraintName="fk_zc_task_enrolment"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_task" constraintName="fk_zc_task_member"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-10-06" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_task"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_task_dependency'::regclass AND conname IN ('fk_zc_task_dependency_tenant', 'fk_zc_task_dependency_task', 'fk_zc_task_dependency_depends_on')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_task_dependency.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_task_dependency
+  ADD CONSTRAINT fk_zc_task_dependency_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_task_dependency
+  ADD CONSTRAINT fk_zc_task_dependency_task FOREIGN KEY (tenant_id, task_id)
+    REFERENCES zc_task (tenant_id, id);
+ALTER TABLE zc_task_dependency
+  ADD CONSTRAINT fk_zc_task_dependency_depends_on FOREIGN KEY (tenant_id, depends_on_task_id)
+    REFERENCES zc_task (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_task_dependency" constraintName="fk_zc_task_dependency_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_task_dependency" constraintName="fk_zc_task_dependency_task"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_task_dependency" constraintName="fk_zc_task_dependency_depends_on"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-10-07" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_task"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_task_assignment_history'::regclass AND conname IN ('fk_zc_task_assignment_history_tenant', 'fk_zc_task_assignment_history_task')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_task_assignment_history.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_task_assignment_history
+  ADD CONSTRAINT fk_zc_task_assignment_history_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_task_assignment_history
+  ADD CONSTRAINT fk_zc_task_assignment_history_task FOREIGN KEY (tenant_id, task_id)
+    REFERENCES zc_task (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_task_assignment_history" constraintName="fk_zc_task_assignment_history_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_task_assignment_history" constraintName="fk_zc_task_assignment_history_task"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-10-08" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_work_queue_definition'::regclass AND conname IN ('fk_zc_work_queue_definition_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_work_queue_definition.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_work_queue_definition
+  ADD CONSTRAINT fk_zc_work_queue_definition_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_work_queue_definition" constraintName="fk_zc_work_queue_definition_tenant"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 3. Triggers -->
+    <changeSet id="20260929-10-09" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_task'::regclass AND tgname IN ('trg_zc_task_dependency_gate', 'trg_zc_task_touch')</sqlCheck>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('zc_task_dependency_gate')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_task.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- A task can't complete while a prerequisite is open. Cancelled counts as closed.
+CREATE FUNCTION zc_task_dependency_gate() RETURNS trigger
+  LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  v_open_count integer;
+BEGIN
+  SELECT count(*)
+    INTO v_open_count
+    FROM public.zc_task_dependency d
+    JOIN public.zc_task p
+      ON p.tenant_id = d.tenant_id
+     AND p.id = d.depends_on_task_id
+   WHERE d.tenant_id = NEW.tenant_id
+     AND d.task_id = NEW.id
+     AND d.removed_at IS NULL
+     AND p.status NOT IN ('completed','cancelled');
+  IF v_open_count > 0 THEN
+    RAISE EXCEPTION 'trg_zc_task_dependency_gate: task % has % open prerequisite(s)', NEW.id, v_open_count
+      USING ERRCODE = 'integrity_constraint_violation',
+            CONSTRAINT = 'trg_zc_task_dependency_gate', TABLE = TG_TABLE_NAME;
+  END IF;
+  RETURN NEW;
+END
+$fn$;
+
+CREATE TRIGGER trg_zc_task_dependency_gate
+  BEFORE UPDATE OF status ON zc_task
+  FOR EACH ROW
+  WHEN (NEW.status = 'completed' AND OLD.status IS DISTINCT FROM 'completed')
+  EXECUTE FUNCTION zc_task_dependency_gate();
+CREATE TRIGGER trg_zc_task_touch BEFORE UPDATE ON zc_task FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_task_dependency_gate ON zc_task;
+DROP TRIGGER trg_zc_task_touch ON zc_task;
+DROP FUNCTION zc_task_dependency_gate();
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-10-10" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_task_dependency'::regclass AND tgname IN ('trg_zc_task_dependency_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_task_dependency.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_task_dependency_touch BEFORE UPDATE ON zc_task_dependency FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_task_dependency_touch ON zc_task_dependency;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-10-11" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_task_assignment_history'::regclass AND tgname IN ('trg_zc_task_assignment_history_append_only', 'trg_zc_task_assignment_history_no_truncate')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_task_assignment_history.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_task_assignment_history_append_only BEFORE UPDATE OR DELETE ON zc_task_assignment_history FOR EACH ROW EXECUTE FUNCTION zc_forbid_change('trg_zc_task_assignment_history_append_only');
+CREATE TRIGGER trg_zc_task_assignment_history_no_truncate BEFORE TRUNCATE ON zc_task_assignment_history FOR EACH STATEMENT EXECUTE FUNCTION zc_forbid_change('trg_zc_task_assignment_history_append_only');
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_task_assignment_history_append_only ON zc_task_assignment_history;
+DROP TRIGGER trg_zc_task_assignment_history_no_truncate ON zc_task_assignment_history;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-10-12" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_work_queue_definition'::regclass AND tgname IN ('trg_zc_work_queue_definition_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_work_queue_definition.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_work_queue_definition_touch BEFORE UPDATE ON zc_work_queue_definition FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_work_queue_definition_touch ON zc_work_queue_definition;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 4. Tenant isolation (row-level security) -->
+    <changeSet id="20260929-10-13" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_policy WHERE polname IN ('rls_zc_task_tenant', 'rls_zc_task_dependency_tenant', 'rls_zc_task_assignment_history_tenant', 'rls_zc_work_queue_definition_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Enable and force row-level security, with a tenant policy, on zc_task, zc_task_dependency, zc_task_assignment_history, zc_work_queue_definition.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Tenant isolation. The app must connect as zc_app: superusers bypass RLS.
+ALTER TABLE zc_task ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_task FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_task_tenant ON zc_task
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_task_dependency ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_task_dependency FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_task_dependency_tenant ON zc_task_dependency
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_task_assignment_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_task_assignment_history FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_task_assignment_history_tenant ON zc_task_assignment_history
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_work_queue_definition ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_work_queue_definition FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_work_queue_definition_tenant ON zc_work_queue_definition
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP POLICY rls_zc_task_tenant ON zc_task;
+ALTER TABLE zc_task NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_task DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_task_dependency_tenant ON zc_task_dependency;
+ALTER TABLE zc_task_dependency NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_task_dependency DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_task_assignment_history_tenant ON zc_task_assignment_history;
+ALTER TABLE zc_task_assignment_history NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_task_assignment_history DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_work_queue_definition_tenant ON zc_work_queue_definition;
+ALTER TABLE zc_work_queue_definition NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_work_queue_definition DISABLE ROW LEVEL SECURITY;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 5. Privileges for zc_app and zc_housekeeping -->
+    <changeSet id="20260929-10-14" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="2">SELECT count(*) FROM pg_roles WHERE rolname IN ('zc_app', 'zc_housekeeping')</sqlCheck>
+        </preConditions>
+        <comment>Grant the application privileges on the carework tables; append-only tables get no UPDATE, and no table gets DELETE.</comment>
+        <sql splitStatements="false"><![CDATA[
+GRANT SELECT, INSERT, UPDATE ON zc_task TO zc_app;
+GRANT USAGE ON SEQUENCE zc_task_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_task_dependency TO zc_app;
+GRANT USAGE ON SEQUENCE zc_task_dependency_id_seq TO zc_app;
+GRANT SELECT, INSERT ON zc_task_assignment_history TO zc_app;
+REVOKE UPDATE, DELETE, TRUNCATE ON zc_task_assignment_history FROM zc_app;
+GRANT USAGE ON SEQUENCE zc_task_assignment_history_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_work_queue_definition TO zc_app;
+GRANT USAGE ON SEQUENCE zc_work_queue_definition_id_seq TO zc_app;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+REVOKE ALL ON zc_task FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_task_id_seq FROM zc_app;
+REVOKE ALL ON zc_task_dependency FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_task_dependency_id_seq FROM zc_app;
+REVOKE ALL ON zc_task_assignment_history FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_task_assignment_history_id_seq FROM zc_app;
+REVOKE ALL ON zc_work_queue_definition FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_work_queue_definition_id_seq FROM zc_app;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+</databaseChangeLog>

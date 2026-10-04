@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- 20260929_17_ai.xml -->
+    <!-- AI decision support (switched off): advisory recommendations and their human reviews. -->
+    <!-- Owned by the ai domain: com.zimasahealth.zcare.domains.ai (roadmap milestone M19). -->
+    <!-- Source: agreed design V001 section 15 and V002 grants. Author: adam16wilson7136 -->
+
+    <!-- 1. Tables, with their keys, checks, indexes and comments -->
+    <changeSet id="20260929-17-01" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_ai_recommendation"/></not>
+        </preConditions>
+        <comment>Create table zc_ai_recommendation.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_ai_recommendation (
+  id                   bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id            bigint NOT NULL,
+  subject_type         text NOT NULL,
+  subject_id           bigint NOT NULL, -- polymorphic, no FK
+  recommendation_type  text NOT NULL,
+  content              jsonb NOT NULL,
+  model_ref            text NOT NULL,
+  rationale            text,
+  is_advisory          boolean NOT NULL DEFAULT true,
+  status               text NOT NULL DEFAULT 'pending_review',
+  generated_at         timestamptz NOT NULL DEFAULT now(),
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_ai_recommendation_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_ai_recommendation_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_ai_recommendation PRIMARY KEY (id),
+  CONSTRAINT uq_zc_ai_recommendation_fk_target UNIQUE (tenant_id, id),
+  -- AI output is always advisory.
+  CONSTRAINT ck_zc_ai_advisory CHECK (is_advisory = true),
+  CONSTRAINT ck_zc_ai_recommendation_subject_type CHECK (subject_type IN (
+    'enrolment','care_plan','care_gap','task','risk_classification','outreach_request','assessment','referral')),
+  CONSTRAINT ck_zc_ai_recommendation_type CHECK (btrim(recommendation_type) <> ''),
+  CONSTRAINT ck_zc_ai_recommendation_model_ref CHECK (btrim(model_ref) <> ''),
+  CONSTRAINT ck_zc_ai_recommendation_status CHECK (status IN ('pending_review','reviewed','expired'))
+);
+COMMENT ON COLUMN zc_ai_recommendation.content IS 'jsonb: explainability payload of the recommendation.';
+CREATE INDEX ix_zc_ai_recommendation_subject ON zc_ai_recommendation (tenant_id, subject_type, subject_id);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_ai_recommendation"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-17-02" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_ai_review"/></not>
+        </preConditions>
+        <comment>Create table zc_ai_review.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_ai_review (
+  id                 bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id          bigint NOT NULL,
+  recommendation_id  bigint NOT NULL,
+  decision           text NOT NULL,
+  reviewed_by        text NOT NULL,
+  reviewed_at        timestamptz NOT NULL DEFAULT now(),
+  rationale          text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_ai_review_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_ai_review_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_ai_review PRIMARY KEY (id),
+  CONSTRAINT ck_zc_ai_review_decision CHECK (decision IN ('accepted','modified','rejected')),
+  CONSTRAINT ck_zc_ai_review_reviewer CHECK (btrim(reviewed_by) <> ''),
+  CONSTRAINT ck_zc_ai_review_rationale CHECK (decision = 'accepted' OR nullif(btrim(rationale), '') IS NOT NULL)
+);
+CREATE INDEX ix_zc_ai_review_recommendation ON zc_ai_review (tenant_id, recommendation_id);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_ai_review"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 2. Foreign keys, after every referenced table exists -->
+    <changeSet id="20260929-17-03" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_ai_recommendation'::regclass AND conname IN ('fk_zc_ai_recommendation_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_ai_recommendation.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_ai_recommendation
+  ADD CONSTRAINT fk_zc_ai_recommendation_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_ai_recommendation" constraintName="fk_zc_ai_recommendation_tenant"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-17-04" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_ai_recommendation"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_ai_review'::regclass AND conname IN ('fk_zc_ai_review_tenant', 'fk_zc_ai_review_recommendation')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_ai_review.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_ai_review
+  ADD CONSTRAINT fk_zc_ai_review_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_ai_review
+  ADD CONSTRAINT fk_zc_ai_review_recommendation FOREIGN KEY (tenant_id, recommendation_id)
+    REFERENCES zc_ai_recommendation (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_ai_review" constraintName="fk_zc_ai_review_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_ai_review" constraintName="fk_zc_ai_review_recommendation"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 3. Triggers -->
+    <changeSet id="20260929-17-05" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_ai_recommendation'::regclass AND tgname IN ('trg_zc_ai_recommendation_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_ai_recommendation.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_ai_recommendation_touch BEFORE UPDATE ON zc_ai_recommendation FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_ai_recommendation_touch ON zc_ai_recommendation;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-17-06" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_ai_review'::regclass AND tgname IN ('trg_zc_ai_review_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_ai_review.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_ai_review_touch BEFORE UPDATE ON zc_ai_review FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_ai_review_touch ON zc_ai_review;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 4. Tenant isolation (row-level security) -->
+    <changeSet id="20260929-17-07" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_policy WHERE polname IN ('rls_zc_ai_recommendation_tenant', 'rls_zc_ai_review_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Enable and force row-level security, with a tenant policy, on zc_ai_recommendation, zc_ai_review.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Tenant isolation. The app must connect as zc_app: superusers bypass RLS.
+ALTER TABLE zc_ai_recommendation ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_ai_recommendation FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_ai_recommendation_tenant ON zc_ai_recommendation
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_ai_review ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_ai_review FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_ai_review_tenant ON zc_ai_review
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP POLICY rls_zc_ai_recommendation_tenant ON zc_ai_recommendation;
+ALTER TABLE zc_ai_recommendation NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_ai_recommendation DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_ai_review_tenant ON zc_ai_review;
+ALTER TABLE zc_ai_review NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_ai_review DISABLE ROW LEVEL SECURITY;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 5. Privileges for zc_app and zc_housekeeping -->
+    <changeSet id="20260929-17-08" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="2">SELECT count(*) FROM pg_roles WHERE rolname IN ('zc_app', 'zc_housekeeping')</sqlCheck>
+        </preConditions>
+        <comment>Grant the application privileges on the ai tables; append-only tables get no UPDATE, and no table gets DELETE.</comment>
+        <sql splitStatements="false"><![CDATA[
+GRANT SELECT, INSERT, UPDATE ON zc_ai_recommendation TO zc_app;
+GRANT USAGE ON SEQUENCE zc_ai_recommendation_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_ai_review TO zc_app;
+GRANT USAGE ON SEQUENCE zc_ai_review_id_seq TO zc_app;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+REVOKE ALL ON zc_ai_recommendation FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_ai_recommendation_id_seq FROM zc_app;
+REVOKE ALL ON zc_ai_review FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_ai_review_id_seq FROM zc_app;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+</databaseChangeLog>

@@ -1,0 +1,12 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "ZCare Docker",
+      "Group": "Servers",
+      "Host": "localhost",
+      "Port": 5433,
+      "MaintenanceDB": "postgres",
+      "Username": "postgres"
+    }
+  }
+}

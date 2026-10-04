@@ -1,0 +1,322 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- 20260929_15_engagement.xml -->
+    <!-- Engagement and Outreach: outreach requests, delivery attempts and inbound member messages. -->
+    <!-- Owned by the engagement domain: com.zimasahealth.zcare.domains.engagement (roadmap milestone M15). -->
+    <!-- Source: agreed design V001 section 13, V002 grants and the corrected V003. Author: adam16wilson7136 -->
+
+    <!-- 1. Tables, with their keys, checks, indexes and comments -->
+    <changeSet id="20260929-15-01" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_outreach_request"/></not>
+        </preConditions>
+        <comment>Create table zc_outreach_request.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_outreach_request (
+  id                  bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id           bigint NOT NULL,
+  member_id           bigint NOT NULL,
+  enrolment_id        bigint, -- NULL for pre-enrolment invites
+  content_class       text NOT NULL,
+  purpose             text NOT NULL,
+  template_ref        text,
+  status              text NOT NULL DEFAULT 'requested',
+  requested_at        timestamptz NOT NULL DEFAULT now(),
+  scheduled_for       timestamptz,
+  dispatched_at       timestamptz,
+  completed_at        timestamptz,
+  hold_reason         text,
+  suppression_reason  text,
+  failure_reason      text,
+  cancel_reason       text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_outreach_request_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_outreach_request_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_outreach_request PRIMARY KEY (id),
+  CONSTRAINT uq_zc_outreach_request_fk_target UNIQUE (tenant_id, id),
+  CONSTRAINT ck_zc_outreach_request_content_class CHECK (content_class IN ('condition_neutral','health_content')),
+  -- Health content needs an enrolment.
+  CONSTRAINT ck_zc_outreach_request_health_content CHECK (
+    content_class <> 'health_content' OR enrolment_id IS NOT NULL),
+  CONSTRAINT ck_zc_outreach_request_purpose CHECK (btrim(purpose) <> ''),
+  CONSTRAINT ck_zc_outreach_request_status CHECK (status IN (
+    'requested','queued','held','dispatched','delivered','completed','failed','cancelled','suppressed')),
+  CONSTRAINT ck_zc_outreach_request_held CHECK (status <> 'held' OR nullif(btrim(hold_reason), '') IS NOT NULL),
+  CONSTRAINT ck_zc_outreach_request_suppressed CHECK (
+    status <> 'suppressed' OR nullif(btrim(suppression_reason), '') IS NOT NULL),
+  CONSTRAINT ck_zc_outreach_request_failed CHECK (status <> 'failed' OR nullif(btrim(failure_reason), '') IS NOT NULL),
+  CONSTRAINT ck_zc_outreach_request_cancelled CHECK (
+    status <> 'cancelled' OR nullif(btrim(cancel_reason), '') IS NOT NULL)
+);
+CREATE INDEX ix_zc_outreach_pending
+  ON zc_outreach_request (tenant_id, scheduled_for, requested_at)
+  WHERE status IN ('requested','queued');
+CREATE INDEX ix_zc_outreach_request_member ON zc_outreach_request (tenant_id, member_id, requested_at DESC);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_outreach_request"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-15-02" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_outreach_delivery"/></not>
+        </preConditions>
+        <comment>Create table zc_outreach_delivery.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_outreach_delivery (
+  id                   bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id            bigint NOT NULL,
+  outreach_request_id  bigint NOT NULL,
+  attempt_number       integer NOT NULL DEFAULT 1,
+  channel              text NOT NULL,
+  status               text NOT NULL DEFAULT 'pending',
+  channel_message_ref  text,   -- e.g. WhatsApp wamid
+  sent_at              timestamptz,
+  delivered_at         timestamptz,
+  read_at              timestamptz,
+  failed_at            timestamptz,
+  failure_reason       text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_outreach_delivery_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_outreach_delivery_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_outreach_delivery PRIMARY KEY (id),
+  -- One row per retry.
+  CONSTRAINT uq_zc_outreach_delivery_attempt UNIQUE (tenant_id, outreach_request_id, attempt_number),
+  CONSTRAINT ck_zc_outreach_delivery_attempt CHECK (attempt_number >= 1),
+  CONSTRAINT ck_zc_outreach_delivery_channel CHECK (btrim(channel) <> ''),
+  CONSTRAINT ck_zc_outreach_delivery_status CHECK (status IN ('pending','sent','delivered','read','failed')),
+  CONSTRAINT ck_zc_outreach_delivery_failed CHECK (
+    status <> 'failed' OR (failed_at IS NOT NULL AND nullif(btrim(failure_reason), '') IS NOT NULL))
+);
+CREATE UNIQUE INDEX uq_zc_outreach_delivery_channel_ref
+  ON zc_outreach_delivery (tenant_id, channel, channel_message_ref)
+  WHERE channel_message_ref IS NOT NULL;
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_outreach_delivery"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-15-03" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <not><tableExists schemaName="public" tableName="zc_inbound_message"/></not>
+        </preConditions>
+        <comment>Create table zc_inbound_message.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TABLE zc_inbound_message (
+  id                   bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id            bigint NOT NULL,
+  member_id            bigint, -- NULL until sender is matched
+  channel              text NOT NULL,
+  channel_message_ref  text NOT NULL,   -- e.g. wamid
+  sender_address       text NOT NULL,
+  context_message_ref  text,            -- message being replied to
+  received_at          timestamptz NOT NULL DEFAULT now(),
+  body                 text,
+  interpreted_as       text,
+  interpreted_at       timestamptz,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  created_by   text NOT NULL CONSTRAINT ck_zc_inbound_message_created_by CHECK (btrim(created_by) <> ''),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  updated_by   text,
+  row_version  integer NOT NULL DEFAULT 1 CONSTRAINT ck_zc_inbound_message_row_version CHECK (row_version >= 1),
+  CONSTRAINT pk_zc_inbound_message PRIMARY KEY (id),
+  -- Dedupe webhook redeliveries.
+  CONSTRAINT uq_zc_inbound_message_dedup UNIQUE (tenant_id, channel, channel_message_ref),
+  CONSTRAINT ck_zc_inbound_message_channel CHECK (btrim(channel) <> ''),
+  CONSTRAINT ck_zc_inbound_message_ref CHECK (btrim(channel_message_ref) <> ''),
+  -- Vocabulary from the trial system's V003 (PRD addendum ADD-001 Part B): an opt-out
+  -- word inside a longer message is consent_opt_out_ambiguous and waits for a human.
+  CONSTRAINT ck_zc_inbound_message_interpreted_as CHECK (interpreted_as IN (
+    'consent_opt_in','consent_opt_out','consent_opt_out_ambiguous','consent_decline',
+    'assessment_answer','refill_reply','task_reply','unrecognised')),
+  CONSTRAINT ck_zc_inbound_message_interpretation_pair CHECK ((interpreted_as IS NULL) = (interpreted_at IS NULL))
+);
+CREATE INDEX ix_zc_inbound_message_member ON zc_inbound_message (tenant_id, member_id, received_at DESC);
+        ]]></sql>
+        <rollback>
+            <dropTable schemaName="public" tableName="zc_inbound_message"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 2. Foreign keys, after every referenced table exists -->
+    <changeSet id="20260929-15-04" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_member_reference"/>
+            <tableExists schemaName="public" tableName="zc_enrolment"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_outreach_request'::regclass AND conname IN ('fk_zc_outreach_request_tenant', 'fk_zc_outreach_request_member', 'fk_zc_outreach_request_enrolment')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_outreach_request.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_outreach_request
+  ADD CONSTRAINT fk_zc_outreach_request_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_outreach_request
+  ADD CONSTRAINT fk_zc_outreach_request_member FOREIGN KEY (tenant_id, member_id)
+    REFERENCES zc_member_reference (tenant_id, id);
+ALTER TABLE zc_outreach_request
+  ADD CONSTRAINT fk_zc_outreach_request_enrolment FOREIGN KEY (tenant_id, enrolment_id, member_id)
+    REFERENCES zc_enrolment (tenant_id, id, member_id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_outreach_request" constraintName="fk_zc_outreach_request_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_outreach_request" constraintName="fk_zc_outreach_request_member"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_outreach_request" constraintName="fk_zc_outreach_request_enrolment"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-15-05" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_outreach_request"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_outreach_delivery'::regclass AND conname IN ('fk_zc_outreach_delivery_tenant', 'fk_zc_outreach_delivery_outreach_request')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_outreach_delivery.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_outreach_delivery
+  ADD CONSTRAINT fk_zc_outreach_delivery_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_outreach_delivery
+  ADD CONSTRAINT fk_zc_outreach_delivery_outreach_request FOREIGN KEY (tenant_id, outreach_request_id)
+    REFERENCES zc_outreach_request (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_outreach_delivery" constraintName="fk_zc_outreach_delivery_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_outreach_delivery" constraintName="fk_zc_outreach_delivery_outreach_request"/>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-15-06" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <tableExists schemaName="public" tableName="zc_tenant"/>
+            <tableExists schemaName="public" tableName="zc_member_reference"/>
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_constraint WHERE conrelid = 'public.zc_inbound_message'::regclass AND conname IN ('fk_zc_inbound_message_tenant', 'fk_zc_inbound_message_member')</sqlCheck>
+        </preConditions>
+        <comment>Add the foreign keys of zc_inbound_message.</comment>
+        <sql splitStatements="false"><![CDATA[
+ALTER TABLE zc_inbound_message
+  ADD CONSTRAINT fk_zc_inbound_message_tenant FOREIGN KEY (tenant_id) REFERENCES zc_tenant (id);
+ALTER TABLE zc_inbound_message
+  ADD CONSTRAINT fk_zc_inbound_message_member FOREIGN KEY (tenant_id, member_id)
+    REFERENCES zc_member_reference (tenant_id, id);
+        ]]></sql>
+        <rollback>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_inbound_message" constraintName="fk_zc_inbound_message_tenant"/>
+            <dropForeignKeyConstraint baseTableSchemaName="public" baseTableName="zc_inbound_message" constraintName="fk_zc_inbound_message_member"/>
+        </rollback>
+    </changeSet>
+
+    <!-- 3. Triggers -->
+    <changeSet id="20260929-15-07" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_outreach_request'::regclass AND tgname IN ('trg_zc_outreach_request_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_outreach_request.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_outreach_request_touch BEFORE UPDATE ON zc_outreach_request FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_outreach_request_touch ON zc_outreach_request;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-15-08" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_outreach_delivery'::regclass AND tgname IN ('trg_zc_outreach_delivery_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_outreach_delivery.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_outreach_delivery_touch BEFORE UPDATE ON zc_outreach_delivery FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_outreach_delivery_touch ON zc_outreach_delivery;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+    <changeSet id="20260929-15-09" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.zc_inbound_message'::regclass AND tgname IN ('trg_zc_inbound_message_touch')</sqlCheck>
+        </preConditions>
+        <comment>Create the triggers on zc_inbound_message.</comment>
+        <sql splitStatements="false"><![CDATA[
+CREATE TRIGGER trg_zc_inbound_message_touch BEFORE UPDATE ON zc_inbound_message FOR EACH ROW EXECUTE FUNCTION zc_touch_row();
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP TRIGGER trg_zc_inbound_message_touch ON zc_inbound_message;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 4. Tenant isolation (row-level security) -->
+    <changeSet id="20260929-15-10" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="0">SELECT count(*) FROM pg_policy WHERE polname IN ('rls_zc_outreach_request_tenant', 'rls_zc_outreach_delivery_tenant', 'rls_zc_inbound_message_tenant')</sqlCheck>
+        </preConditions>
+        <comment>Enable and force row-level security, with a tenant policy, on zc_outreach_request, zc_outreach_delivery, zc_inbound_message.</comment>
+        <sql splitStatements="false"><![CDATA[
+-- Tenant isolation. The app must connect as zc_app: superusers bypass RLS.
+ALTER TABLE zc_outreach_request ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_outreach_request FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_outreach_request_tenant ON zc_outreach_request
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_outreach_delivery ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_outreach_delivery FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_outreach_delivery_tenant ON zc_outreach_delivery
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+ALTER TABLE zc_inbound_message ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zc_inbound_message FORCE ROW LEVEL SECURITY;
+CREATE POLICY rls_zc_inbound_message_tenant ON zc_inbound_message
+  USING (tenant_id = zc_current_tenant())
+  WITH CHECK (tenant_id = zc_current_tenant());
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+DROP POLICY rls_zc_outreach_request_tenant ON zc_outreach_request;
+ALTER TABLE zc_outreach_request NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_outreach_request DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_outreach_delivery_tenant ON zc_outreach_delivery;
+ALTER TABLE zc_outreach_delivery NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_outreach_delivery DISABLE ROW LEVEL SECURITY;
+DROP POLICY rls_zc_inbound_message_tenant ON zc_inbound_message;
+ALTER TABLE zc_inbound_message NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE zc_inbound_message DISABLE ROW LEVEL SECURITY;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+
+    <!-- 5. Privileges for zc_app and zc_housekeeping -->
+    <changeSet id="20260929-15-11" author="adam16wilson7136" dbms="postgresql">
+        <preConditions onFail="HALT">
+            <sqlCheck expectedResult="2">SELECT count(*) FROM pg_roles WHERE rolname IN ('zc_app', 'zc_housekeeping')</sqlCheck>
+        </preConditions>
+        <comment>Grant the application privileges on the engagement tables; append-only tables get no UPDATE, and no table gets DELETE.</comment>
+        <sql splitStatements="false"><![CDATA[
+GRANT SELECT, INSERT, UPDATE ON zc_outreach_request TO zc_app;
+GRANT USAGE ON SEQUENCE zc_outreach_request_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_outreach_delivery TO zc_app;
+GRANT USAGE ON SEQUENCE zc_outreach_delivery_id_seq TO zc_app;
+GRANT SELECT, INSERT, UPDATE ON zc_inbound_message TO zc_app;
+GRANT USAGE ON SEQUENCE zc_inbound_message_id_seq TO zc_app;
+        ]]></sql>
+        <rollback>
+            <sql splitStatements="false"><![CDATA[
+REVOKE ALL ON zc_outreach_request FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_outreach_request_id_seq FROM zc_app;
+REVOKE ALL ON zc_outreach_delivery FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_outreach_delivery_id_seq FROM zc_app;
+REVOKE ALL ON zc_inbound_message FROM zc_app;
+REVOKE USAGE ON SEQUENCE zc_inbound_message_id_seq FROM zc_app;
+            ]]></sql>
+        </rollback>
+    </changeSet>
+</databaseChangeLog>

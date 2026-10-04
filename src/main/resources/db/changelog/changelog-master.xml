@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+                            http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- zimasa-zcare-service master changelog: include elements only, in NN order (DB-02, DB-03). -->
+    <include file="db/changelog/migrations/20260929_01_database_functions.xml"/>
+    <include file="db/changelog/migrations/20260929_02_database_roles.xml"/>
+    <include file="db/changelog/migrations/20260929_03_access.xml"/>
+    <include file="db/changelog/migrations/20260929_04_external_reference.xml"/>
+    <include file="db/changelog/migrations/20260929_05_programme.xml"/>
+    <include file="db/changelog/migrations/20260929_06_cohort.xml"/>
+    <include file="db/changelog/migrations/20260929_07_enrolment.xml"/>
+    <include file="db/changelog/migrations/20260929_08_assessment.xml"/>
+    <include file="db/changelog/migrations/20260929_09_careplan.xml"/>
+    <include file="db/changelog/migrations/20260929_10_carework.xml"/>
+    <include file="db/changelog/migrations/20260929_11_referral.xml"/>
+    <include file="db/changelog/migrations/20260929_12_medication.xml"/>
+    <include file="db/changelog/migrations/20260929_13_observation.xml"/>
+    <include file="db/changelog/migrations/20260929_14_caregap.xml"/>
+    <include file="db/changelog/migrations/20260929_15_engagement.xml"/>
+    <include file="db/changelog/migrations/20260929_16_outcome.xml"/>
+    <include file="db/changelog/migrations/20260929_17_ai.xml"/>
+    <include file="db/changelog/migrations/20260929_18_audit.xml"/>
+    <include file="db/changelog/migrations/20260929_19_integration.xml"/>
+    <include file="db/changelog/migrations/20260929_20_security_posture_checks.xml"/>
+</databaseChangeLog>
