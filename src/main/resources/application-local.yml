@@ -1,0 +1,5 @@
+# Local development: run with SPRING_PROFILES_ACTIVE=local and the variables from .env.
+# Tokens are signed with the shared ZCARE_JWT_HMAC_SECRET (see scripts/dev-token.sh) instead of Keycloak.
+logging:
+  level:
+    com.zimasahealth.zcare: DEBUG
