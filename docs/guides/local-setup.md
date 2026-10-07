@@ -91,3 +91,63 @@ ROLLBACK;
 
 Without the `set_config` call every tenant table reads empty. That is row-level security working,
 not missing data.
+
+## 5. Run the service
+
+1. In `.env`, set `ZCARE_JWT_HMAC_SECRET` to a random string of at least 32 characters. It signs
+   local tokens in place of Keycloak.
+2. Start the service with the variables from `.env`. At startup it applies any pending
+   changesets as the schema owner, then connects as `zc_app`.
+
+   ```sh
+   set -a; . ./.env; set +a
+   ./mvnw spring-boot:run
+   ```
+
+   ```powershell
+   Get-Content .env | Where-Object { $_ -match '^\w+=' } | ForEach-Object { $k, $v = $_ -split '=', 2; Set-Item "env:$k" $v }
+   .\mvnw.cmd spring-boot:run
+   ```
+
+3. Register a tenant as the schema owner. `zc_app` can only read `zc_tenant` (OD-14).
+
+   ```sql
+   INSERT INTO zc_tenant (code, name, created_by) VALUES ('acme-health', 'Acme Health', 'local-setup');
+   ```
+
+4. Mint a token and call the API:
+
+   ```sh
+   TOKEN=$(scripts/dev-token.sh pa-001 programme_admin acme-health)
+   curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/programmes
+   ```
+
+   Every POST also needs `Idempotency-Key: <uuid>`. Swagger UI is at
+   http://localhost:8080/swagger-ui.html. Conventions and endpoints: [../api/README.md](../api/README.md).
+
+Assisted consent validates only once Privacy has approved the script. Record that as a tenant
+setting, with a platform-admin token:
+
+```sh
+curl -X POST -H "Authorization: Bearer $PLATFORM_TOKEN" -H "Idempotency-Key: $(uuidgen)" \
+  -H "Content-Type: application/json" http://localhost:8080/api/v1/config \
+  -d '{"scope":"privacy","key":"assisted_consent_privacy_approved","value":"true","changeReason":"Privacy approval recorded"}'
+```
+
+## 6. Use it through the web server
+
+Browsers never call the API directly. The web server holds the session and the token
+([../../web-server/README.md](../../web-server/README.md)).
+
+1. In `.env`, set `ZCARE_WEB_SIGN_IN=local` and `ZCARE_WEB_LOCAL_PASSWORD` (at least 12
+   characters). Keycloak sign-in is a placeholder for now.
+2. With the service running, start the web server in a second terminal:
+
+   ```powershell
+   Get-Content .env | Where-Object { $_ -match '^\w+=' } | ForEach-Object { $k, $v = $_ -split '=', 2; Set-Item "env:$k" $v }
+   .\mvnw.cmd -f web-server\pom.xml spring-boot:run
+   ```
+
+3. Open http://localhost:8081 and sign in as `pa-001`, `cm-001`, `cl-001` or `plat-001` with
+   that password. Keep the browser's dev tools open: the network tab shows a session cookie and
+   same-origin `/api/v1` calls, never a token or the tenant.

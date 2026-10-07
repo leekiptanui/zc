@@ -63,6 +63,25 @@ Table-level detail: [database/migration-plan.md](../database/migration-plan.md).
   another domain's repositories or entities. Effects that need no compile-time link travel as
   domain events through the transactional outbox.
 - The base package holds nothing but `ZimasaZcareApplication` (PKG-02).
+- Effects across domains within one request travel as in-process events (for example
+  `EnrolmentExitedEvent`), handled in the publishing transaction. The consent gate and the
+  care-context composer are interfaces in `common`, implemented by the domains
+  ([ADR-0006](../adr/0006-cross-cutting-writers-and-in-process-domain-events.md)).
+- `ArchitectureTest` enforces these rules.
+
+## Request path
+
+Each request passes through four stages:
+
+1. **Correlation.** The correlation filter takes or generates `X-Correlation-Id`.
+2. **Authentication.** The bearer token is verified, through Keycloak or a local HS256 secret.
+3. **Tenant binding.** The tenant is taken from the verified token, never from the URL.
+4. **Idempotency.** Mutating calls are checked against cached envelopes.
+
+The controller's `@PreAuthorize` then checks the role. Every transaction begins with
+`set_config('zcare.tenant_id', …)`, set by `tenant.TenantAwareTransactionManager`. Responses
+are the 04B envelope ([ADR-0005](../adr/0005-api-envelope-tenant-binding-and-base-path.md)).
+Audit rows and outbox events are written in the same transaction as the change.
 
 ## Data isolation
 
