@@ -1,0 +1,34 @@
+# Local development: SPRING_PROFILES_ACTIVE=local, ZCARE_WEB_SIGN_IN=local and the variables from .env.
+# Sign in with one of the usernames below and ZCARE_WEB_LOCAL_PASSWORD. This server then signs API
+# tokens with the API's ZCARE_JWT_HMAC_SECRET; the browser never sees them.
+server:
+  servlet:
+    session:
+      cookie:
+        # Plain HTTP on localhost cannot carry a __Host- cookie in every client.
+        name: ${ZCARE_WEB_SESSION_COOKIE:zcare}
+        secure: ${ZCARE_WEB_SECURE_COOKIES:false}
+
+zcare:
+  web:
+    secure-cookies: ${ZCARE_WEB_SECURE_COOKIES:false}
+    local:
+      hmac-secret: ${ZCARE_JWT_HMAC_SECRET:}
+      password: ${ZCARE_WEB_LOCAL_PASSWORD:}
+      users:
+        pa-001:
+          name: Programme Admin (local)
+          tenant: acme-health
+          roles: [programme_admin]
+        cm-001:
+          name: Care Manager (local)
+          tenant: acme-health
+          roles: [care_manager]
+        cl-001:
+          name: Clinician (local)
+          tenant: acme-health
+          roles: [clinician]
+        plat-001:
+          name: Platform Admin (local)
+          tenant: acme-health
+          roles: [platform_admin]

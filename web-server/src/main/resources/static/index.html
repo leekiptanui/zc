@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ZCare session check</title>
+  <link rel="stylesheet" href="check.css">
+  <script type="module" src="check.js"></script>
+</head>
+<body>
+  <main>
+    <h1>ZCare session check</h1>
+    <p class="note">Served by the ZCare web server in place of the staff web app. Open the browser's
+      dev tools while you use it: the network tab shows an opaque session cookie and
+      same-origin <code>/api/v1</code> calls, with no token and no tenant.</p>
+
+    <section id="signed-out" hidden>
+      <h2>Sign in</h2>
+      <form id="sign-in">
+        <label>Username <input name="username" autocomplete="username" required></label>
+        <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+        <button type="submit">Sign in</button>
+      </form>
+      <p id="sign-in-error" class="error" hidden>Sign-in failed.</p>
+    </section>
+
+    <section id="signed-in" hidden>
+      <h2>Signed in as <span id="name"></span></h2>
+      <p>Roles: <span id="roles"></span></p>
+      <button id="load">Count programmes</button>
+      <button id="sign-out">Sign out</button>
+      <p id="result"></p>
+    </section>
+  </main>
+</body>
+</html>

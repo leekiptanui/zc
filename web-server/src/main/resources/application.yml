@@ -1,0 +1,46 @@
+# ZCare web server: serves the staff web app and holds each browser session (ADR-0007).
+# Production-safe defaults; every environment-specific value comes from an environment variable
+# listed in .env.example.
+spring:
+  application:
+    name: zimasa-zcare-web-server
+  web:
+    resources:
+      # The built web app (its dist folder). Defaults to the bundled check page.
+      static-locations: ${ZCARE_WEB_STATIC_LOCATION:classpath:/static/}
+
+server:
+  port: ${ZCARE_WEB_PORT:8081}
+  shutdown: graceful
+  servlet:
+    session:
+      # Idle timeout; the session and everything held in it are discarded after it.
+      timeout: ${ZCARE_WEB_SESSION_TIMEOUT:15m}
+      # Never put the session id in a URL.
+      tracking-modes: cookie
+      cookie:
+        # The __Host- prefix makes the browser refuse the cookie unless it is Secure, host-only and path /.
+        name: ${ZCARE_WEB_SESSION_COOKIE:__Host-zcare}
+        http-only: true
+        secure: ${ZCARE_WEB_SECURE_COOKIES:true}
+        same-site: strict
+        path: /
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+
+zcare:
+  web:
+    # The ZCare API. Reachable from this server only; never expose it to browsers.
+    api-base-url: ${ZCARE_API_BASE_URL:http://localhost:8080}
+    # keycloak is a placeholder that refuses to start until it is built; local is for development.
+    sign-in: ${ZCARE_WEB_SIGN_IN:keycloak}
+    secure-cookies: ${ZCARE_WEB_SECURE_COOKIES:true}
